@@ -613,7 +613,7 @@ void IpaPiSP::applyBlackLevel(const BlackLevelStatus *blackLevelStatus, pisp_be_
 	bla.black_level_gb = blackLevelStatus->blackLevelG;
 	bla.black_level_b = blackLevelStatus->blackLevelB;
 	bla.output_black_level = NormalisedBlackLevel;
-	fe_->SetBla(bla);
+	//fe_->SetBla(bla);
 
 	/* Frontend Stats and Backend black level correction. */
 	bla.black_level_r = bla.black_level_gr =
