@@ -52,6 +52,15 @@ LOG_DEFINE_CATEGORY(CameraSensorProperties)
 const CameraSensorProperties *CameraSensorProperties::get(const std::string &sensor)
 {
 	static const std::map<std::string, const CameraSensorProperties> sensorProps = {
+		{ "ar0144", {
+			.unitCellSize = { 3000, 3000 },
+			.testPatternModes = {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeSolidColor, 1 },
+				{ controls::draft::TestPatternModeColorBars, 2 },
+				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
+			},
+		} },
 		{ "ar0521", {
 			.unitCellSize = { 2200, 2200 },
 			.testPatternModes = {
@@ -77,6 +86,16 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				 * 8: "Slant Pattern"
 				 * 9: "Resolution Pattern"
 				 */
+			},
+		} },
+		{ "imx214", {
+			.unitCellSize = { 1120, 1120 },
+			.testPatternModes = {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeColorBars, 1 },
+				{ controls::draft::TestPatternModeSolidColor, 2 },
+				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
+				{ controls::draft::TestPatternModePn9, 4 },
 			},
 		} },
 		{ "imx219", {

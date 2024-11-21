@@ -10,7 +10,9 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <stdint.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <libcamera/base/class.h>
@@ -158,26 +160,22 @@ public:
 	{
 		return type_ == Type::Dictionary;
 	}
+	bool isEmpty() const
+	{
+		return type_ == Type::Empty;
+	}
+	explicit operator bool() const
+	{
+		return type_ != Type::Empty;
+	}
 
 	std::size_t size() const;
 
-#ifndef __DOXYGEN__
-	template<typename T,
-		 std::enable_if_t<
-			 std::is_same_v<bool, T> ||
-			 std::is_same_v<double, T> ||
-			 std::is_same_v<int8_t, T> ||
-			 std::is_same_v<uint8_t, T> ||
-			 std::is_same_v<int16_t, T> ||
-			 std::is_same_v<uint16_t, T> ||
-			 std::is_same_v<int32_t, T> ||
-			 std::is_same_v<uint32_t, T> ||
-			 std::is_same_v<std::string, T> ||
-			 std::is_same_v<Size, T>> * = nullptr>
-#else
 	template<typename T>
-#endif
-	std::optional<T> get() const;
+	std::optional<T> get() const
+	{
+		return Getter<T>{}.get(*this);
+	}
 
 	template<typename T, typename U>
 	T get(U &&defaultValue) const
@@ -189,6 +187,7 @@ public:
 	template<typename T,
 		 std::enable_if_t<
 			 std::is_same_v<bool, T> ||
+			 std::is_same_v<float, T> ||
 			 std::is_same_v<double, T> ||
 			 std::is_same_v<int8_t, T> ||
 			 std::is_same_v<uint8_t, T> ||
@@ -208,25 +207,33 @@ public:
 
 	const YamlObject &operator[](std::size_t index) const;
 
-	bool contains(const std::string &key) const;
-	const YamlObject &operator[](const std::string &key) const;
+	bool contains(std::string_view key) const;
+	const YamlObject &operator[](std::string_view key) const;
 
 private:
 	LIBCAMERA_DISABLE_COPY_AND_MOVE(YamlObject)
 
+	template<typename T>
+	friend struct Getter;
 	friend class YamlParserContext;
 
 	enum class Type {
 		Dictionary,
 		List,
 		Value,
+		Empty,
+	};
+
+	template<typename T>
+	struct Getter {
+		std::optional<T> get(const YamlObject &obj) const;
 	};
 
 	Type type_;
 
 	std::string value_;
 	Container list_;
-	std::map<std::string, YamlObject *> dictionary_;
+	std::map<std::string, YamlObject *, std::less<>> dictionary_;
 };
 
 class YamlParser final

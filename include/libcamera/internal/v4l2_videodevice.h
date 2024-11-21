@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <queue>
 #include <stdint.h>
 #include <string>
 #include <unordered_set>
@@ -208,6 +209,7 @@ public:
 	int setFormat(V4L2DeviceFormat *format);
 	Formats formats(uint32_t code = 0);
 
+	int getSelection(unsigned int target, Rectangle *rect);
 	int setSelection(unsigned int target, Rectangle *rect);
 
 	int allocateBuffers(unsigned int count,
@@ -266,6 +268,8 @@ private:
 	void bufferAvailable();
 	FrameBuffer *dequeueBuffer();
 
+	int queueToDevice(FrameBuffer *buffer);
+
 	void watchdogExpired();
 
 	template<typename T>
@@ -281,6 +285,7 @@ private:
 
 	V4L2BufferCache *cache_;
 	std::map<unsigned int, FrameBuffer *> queuedBuffers_;
+	std::queue<FrameBuffer *> pendingBuffersToQueue_;
 
 	EventNotifier *fdBufferNotifier_;
 

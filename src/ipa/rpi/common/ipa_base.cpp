@@ -74,6 +74,7 @@ const ControlInfoMap::Map ipaControls{
 	{ &controls::FrameDurationLimits, ControlInfo(INT64_C(33333), INT64_C(120000)) },
 	{ &controls::draft::NoiseReductionMode, ControlInfo(controls::draft::NoiseReductionModeValues) },
 	{ &controls::rpi::StatsOutputEnable, ControlInfo(false, true, false) },
+	{ &controls::rpi::CnnEnableInputTensor, ControlInfo(false, true, false) },
 };
 
 /* IPA controls handled conditionally, if the sensor is not mono */
@@ -96,6 +97,13 @@ const ControlInfoMap::Map ipaAfControls{
 	{ &controls::LensPosition, ControlInfo(0.0f, 32.0f, 1.0f) }
 };
 
+/* Platform specific controls */
+const std::map<const std::string, ControlInfoMap::Map> platformControls {
+	{ "pisp", {
+		{ &controls::rpi::ScalerCrops, ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) }
+	} },
+};
+
 } /* namespace */
 
 LOG_DEFINE_CATEGORY(IPARPI)
@@ -105,7 +113,7 @@ namespace ipa::RPi {
 IpaBase::IpaBase()
 	: controller_(), frameLengths_(FrameLengthsQueueSize, 0s), statsMetadataOutput_(false),
 	  stitchSwapBuffers_(false), frameCount_(0), mistrustCount_(0), lastRunTimestamp_(0),
-	  firstStart_(true), flickerState_({ 0, 0s })
+	  firstStart_(true), flickerState_({ 0, 0s }), cnnEnableInputTensor_(false)
 {
 }
 
@@ -153,11 +161,16 @@ int32_t IpaBase::init(const IPASettings &settings, const InitParams &params, Ini
 	lensPresent_ = params.lensPresent;
 
 	controller_.initialise();
+	helper_->setHwConfig(controller_.getHardwareConfig());
 
 	/* Return the controls handled by the IPA */
 	ControlInfoMap::Map ctrlMap = ipaControls;
 	if (lensPresent_)
 		ctrlMap.merge(ControlInfoMap::Map(ipaAfControls));
+
+	auto platformCtrlsIt = platformControls.find(controller_.getTarget());
+	if (platformCtrlsIt != platformControls.end())
+		ctrlMap.merge(ControlInfoMap::Map(platformCtrlsIt->second));
 
 	monoSensor_ = params.sensorInfo.cfaPattern == properties::draft::ColorFilterArrangementEnum::MONO;
 	if (!monoSensor_)
@@ -1070,6 +1083,7 @@ void IpaBase::applyControls(const ControlList &controls)
 			break;
 		}
 
+		case controls::rpi::SCALER_CROPS:
 		case controls::SCALER_CROP: {
 			/* We do nothing with this, but should avoid the warning below. */
 			break;
@@ -1247,6 +1261,10 @@ void IpaBase::applyControls(const ControlList &controls)
 			statsMetadataOutput_ = ctrl.second.get<bool>();
 			break;
 
+		case controls::rpi::CNN_ENABLE_INPUT_TENSOR:
+			cnnEnableInputTensor_ = ctrl.second.get<bool>();
+			break;
+
 		default:
 			LOG(IPARPI, Warning)
 				<< "Ctrl " << controls::controls.at(ctrl.first)->name()
@@ -1421,6 +1439,51 @@ void IpaBase::reportMetadata(unsigned int ipaContext)
 			libcameraMetadata_.set(controls::HdrChannel, controls::HdrChannelMedium);
 		else
 			libcameraMetadata_.set(controls::HdrChannel, controls::HdrChannelNone);
+	}
+
+	const std::shared_ptr<uint8_t[]> *inputTensor =
+		rpiMetadata.getLocked<std::shared_ptr<uint8_t[]>>("cnn.input_tensor");
+	if (cnnEnableInputTensor_ && inputTensor) {
+		unsigned int size = *rpiMetadata.getLocked<unsigned int>("cnn.input_tensor_size");
+		Span<const uint8_t> tensor{ inputTensor->get(), size };
+		libcameraMetadata_.set(controls::rpi::CnnInputTensor, tensor);
+		/* No need to keep these big buffers any more. */
+		rpiMetadata.eraseLocked("cnn.input_tensor");
+	}
+
+	const RPiController::CnnInputTensorInfo *inputTensorInfo =
+		rpiMetadata.getLocked<RPiController::CnnInputTensorInfo>("cnn.input_tensor_info");
+	if (inputTensorInfo) {
+		Span<const uint8_t> tensorInfo{ reinterpret_cast<const uint8_t *>(inputTensorInfo),
+						sizeof(*inputTensorInfo) };
+		libcameraMetadata_.set(controls::rpi::CnnInputTensorInfo, tensorInfo);
+	}
+
+	const std::shared_ptr<float[]> *outputTensor =
+		rpiMetadata.getLocked<std::shared_ptr<float[]>>("cnn.output_tensor");
+	if (outputTensor) {
+		unsigned int size = *rpiMetadata.getLocked<unsigned int>("cnn.output_tensor_size");
+		Span<const float> tensor{ reinterpret_cast<const float *>(outputTensor->get()),
+					  size };
+		libcameraMetadata_.set(controls::rpi::CnnOutputTensor, tensor);
+		/* No need to keep these big buffers any more. */
+		rpiMetadata.eraseLocked("cnn.output_tensor");
+	}
+
+	const RPiController::CnnOutputTensorInfo *outputTensorInfo =
+		rpiMetadata.getLocked<RPiController::CnnOutputTensorInfo>("cnn.output_tensor_info");
+	if (outputTensorInfo) {
+		Span<const uint8_t> tensorInfo{ reinterpret_cast<const uint8_t *>(outputTensorInfo),
+						sizeof(*outputTensorInfo) };
+		libcameraMetadata_.set(controls::rpi::CnnOutputTensorInfo, tensorInfo);
+	}
+
+	const RPiController::CnnKpiInfo *kpiInfo =
+		rpiMetadata.getLocked<RPiController::CnnKpiInfo>("cnn.kpi_info");
+	if (kpiInfo) {
+		libcameraMetadata_.set(controls::rpi::CnnKpiInfo,
+				       { static_cast<int32_t>(kpiInfo->dnnRuntime),
+					 static_cast<int32_t>(kpiInfo->dspRuntime) });
 	}
 
 	metadataReady.emit(libcameraMetadata_);

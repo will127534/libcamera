@@ -7,8 +7,7 @@
 
 #include "libcamera/internal/formats.h"
 
-#include <algorithm>
-#include <errno.h>
+#include <map>
 
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
@@ -16,7 +15,7 @@
 #include <libcamera/formats.h>
 
 /**
- * \file internal/formats.h
+ * \file libcamera/internal/formats.h
  * \brief Types and helper functions to handle libcamera image formats
  */
 
@@ -158,7 +157,7 @@ const std::map<PixelFormat, PixelFormatInfo> pixelFormatInfo{
 		.colourEncoding = PixelFormatInfo::ColourEncodingRGB,
 		.packed = false,
 		.pixelsPerGroup = 1,
-		.planes = {{ { 3, 1 }, { 0, 0 }, { 0, 0 } }},
+		.planes = {{ { 2, 1 }, { 0, 0 }, { 0, 0 } }},
 	} },
 	{ formats::RGB565_BE, {
 		.name = "RGB565_BE",
@@ -168,7 +167,7 @@ const std::map<PixelFormat, PixelFormatInfo> pixelFormatInfo{
 		.colourEncoding = PixelFormatInfo::ColourEncodingRGB,
 		.packed = false,
 		.pixelsPerGroup = 1,
-		.planes = {{ { 3, 1 }, { 0, 0 }, { 0, 0 } }},
+		.planes = {{ { 2, 1 }, { 0, 0 }, { 0, 0 } }},
 	} },
 	{ formats::BGR888, {
 		.name = "BGR888",

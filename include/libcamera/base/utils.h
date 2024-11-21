@@ -9,12 +9,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iterator>
-#include <memory>
 #include <ostream>
 #include <sstream>
-#include <string>
 #include <string.h>
+#include <string>
 #include <sys/time.h>
 #include <type_traits>
 #include <utility>
@@ -90,6 +90,30 @@ template<typename T,
 _hex hex(T value, unsigned int width = 0);
 
 #ifndef __DOXYGEN__
+template<>
+inline _hex hex<int8_t>(int8_t value, unsigned int width)
+{
+	return { static_cast<uint64_t>(value), width ? width : 2 };
+}
+
+template<>
+inline _hex hex<uint8_t>(uint8_t value, unsigned int width)
+{
+	return { static_cast<uint64_t>(value), width ? width : 2 };
+}
+
+template<>
+inline _hex hex<int16_t>(int16_t value, unsigned int width)
+{
+	return { static_cast<uint64_t>(value), width ? width : 4 };
+}
+
+template<>
+inline _hex hex<uint16_t>(uint16_t value, unsigned int width)
+{
+	return { static_cast<uint64_t>(value), width ? width : 4 };
+}
+
 template<>
 inline _hex hex<int32_t>(int32_t value, unsigned int width)
 {
@@ -374,6 +398,18 @@ constexpr std::underlying_type_t<Enum> to_underlying(Enum e) noexcept
 {
 	return static_cast<std::underlying_type_t<Enum>>(e);
 }
+
+class ScopeExitActions
+{
+public:
+	~ScopeExitActions();
+
+	void operator+=(std::function<void()> &&action);
+	void release();
+
+private:
+	std::vector<std::function<void()>> actions_;
+};
 
 } /* namespace utils */
 

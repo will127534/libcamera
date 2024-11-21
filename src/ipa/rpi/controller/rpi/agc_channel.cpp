@@ -130,7 +130,8 @@ int AgcConstraint::read(const libcamera::YamlObject &params)
 		return -EINVAL;
 	qHi = *value;
 
-	return yTarget.readYaml(params["y_target"]);
+	yTarget = params["y_target"].get<ipa::Pwl>(ipa::Pwl{});
+	return yTarget.empty() ? -EINVAL : 0;
 }
 
 static std::tuple<int, AgcConstraintMode>
@@ -237,9 +238,9 @@ int AgcConfig::read(const libcamera::YamlObject &params)
 			return ret;
 	}
 
-	ret = yTarget.readYaml(params["y_target"]);
-	if (ret)
-		return ret;
+	yTarget = params["y_target"].get<ipa::Pwl>(ipa::Pwl{});
+	if (yTarget.empty())
+		return -EINVAL;
 
 	speed = params["speed"].get<double>(0.2);
 	startupFrames = params["startup_frames"].get<uint16_t>(10);
@@ -882,11 +883,14 @@ void AgcChannel::filterExposure()
 
 	/*
 	 * AGC adapts instantly if both shutter and gain are directly specified
-	 * or we're in the startup phase.
+	 * or we're in the startup phase. Also disable the stable region, because we want
+	 * to reflect any user exposure/gain updates, however small.
 	 */
 	if ((status_.fixedShutter && status_.fixedAnalogueGain) ||
-	    frameCount_ <= config_.startupFrames)
+	    frameCount_ <= config_.startupFrames) {
 		speed = 1.0;
+		stableRegion = 0.0;
+	}
 	if (!filtered_.totalExposure) {
 		filtered_.totalExposure = target_.totalExposure;
 	} else if (filtered_.totalExposure * (1.0 - stableRegion) < target_.totalExposure &&

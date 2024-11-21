@@ -48,7 +48,9 @@ controls_map = {
 
 control_headers = []
 controls_files = []
+controls_files_names = []
 properties_files = []
+properties_files_names = []
 
 foreach mode, entry : controls_map
     files_list = []
@@ -71,13 +73,15 @@ foreach mode, entry : controls_map
     outfile = ''
     if mode == 'controls'
         outfile = 'control_ids.h'
-        controls_files += files_list
+        controls_files += input_files
+        controls_files_names += files_list
     else
         outfile = 'property_ids.h'
-        properties_files += files_list
+        properties_files += input_files
+        properties_files_names += files_list
     endif
 
-    template_file = files(outfile + '.in')
+    template_file = files('control_ids.h.in')
     ranges_file = files('../../src/libcamera/control_ranges.yaml')
     control_headers += custom_target(header + '_h',
                                      input : input_files,
@@ -85,6 +89,7 @@ foreach mode, entry : controls_map
                                      command : [gen_controls, '-o', '@OUTPUT@',
                                                 '--mode', mode, '-t', template_file,
                                                 '-r', ranges_file, '@INPUT@'],
+                                     env : py_build_env,
                                      install : true,
                                      install_dir : libcamera_headers_install_dir)
 endforeach
@@ -104,16 +109,6 @@ formats_h = custom_target('formats_h',
                           install_dir : libcamera_headers_install_dir)
 libcamera_public_headers += formats_h
 
-# libcamera.h
-libcamera_h = custom_target('gen-header',
-                            input : 'meson.build',
-                            output : 'libcamera.h',
-                            command : [gen_header, meson.current_source_dir(), '@OUTPUT@'],
-                            install : true,
-                            install_dir : libcamera_headers_install_dir)
-
-libcamera_public_headers += libcamera_h
-
 # version.h
 version = libcamera_version.split('.')
 libcamera_version_config = configuration_data()
@@ -121,7 +116,18 @@ libcamera_version_config.set('LIBCAMERA_VERSION_MAJOR', version[0])
 libcamera_version_config.set('LIBCAMERA_VERSION_MINOR', version[1])
 libcamera_version_config.set('LIBCAMERA_VERSION_PATCH', version[2])
 
-configure_file(input : 'version.h.in',
-               output : 'version.h',
-               configuration : libcamera_version_config,
-               install_dir : libcamera_headers_install_dir)
+version_h = configure_file(input : 'version.h.in',
+                           output : 'version.h',
+                           configuration : libcamera_version_config,
+                           install_dir : libcamera_headers_install_dir)
+libcamera_public_headers += version_h
+
+# libcamera.h
+libcamera_h = custom_target('gen-header',
+                            input : 'meson.build',
+                            output : 'libcamera.h',
+                            command : [gen_header, '@OUTPUT@', libcamera_public_headers],
+                            install : true,
+                            install_dir : libcamera_headers_install_dir)
+
+libcamera_public_headers += libcamera_h

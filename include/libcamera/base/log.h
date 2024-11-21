@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include <chrono>
 #include <sstream>
 
 #include <libcamera/base/private.h>
@@ -48,6 +47,7 @@ private:
 extern const LogCategory &_LOG_CATEGORY(name)();
 
 #define LOG_DEFINE_CATEGORY(name)					\
+LOG_DECLARE_CATEGORY(name)						\
 const LogCategory &_LOG_CATEGORY(name)()				\
 {									\
 	/* The instance will be deleted by the Logger destructor. */	\

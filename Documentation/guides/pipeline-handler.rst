@@ -1,5 +1,7 @@
 .. SPDX-License-Identifier: CC-BY-SA-4.0
 
+.. include:: ../documentation-contents.rst
+
 Pipeline Handler Writers Guide
 ==============================
 
@@ -151,13 +153,14 @@ integrates with the libcamera build system, and a *vivid.cpp* file that matches
 the name of the pipeline.
 
 In the *meson.build* file, add the *vivid.cpp* file as a build source for
-libcamera by adding it to the global meson ``libcamera_sources`` variable:
+libcamera by adding it to the global meson ``libcamera_internal_sources``
+variable:
 
 .. code-block:: none
 
    # SPDX-License-Identifier: CC0-1.0
 
-   libcamera_sources += files([
+   libcamera_internal_sources += files([
        'vivid.cpp',
    ])
 
@@ -1347,7 +1350,7 @@ before being set.
                         continue;
                  }
 
-                 int32_t value = lroundf(it.second.get<float>() * 128 + offset);
+                 int32_t value = std::lround(it.second.get<float>() * 128 + offset);
                  controls.set(cid, std::clamp(value, 0, 255));
           }
 
@@ -1411,7 +1414,7 @@ value translation operations:
 
 .. code-block:: cpp
 
-   #include <math.h>
+   #include <cmath>
 
 Frame completion and event handling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

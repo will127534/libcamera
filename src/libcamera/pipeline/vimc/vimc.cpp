@@ -6,14 +6,15 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <map>
-#include <math.h>
 #include <tuple>
 
 #include <linux/media-bus-format.h>
 #include <linux/version.h>
 
+#include <libcamera/base/flags.h>
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
@@ -21,6 +22,8 @@
 #include <libcamera/control_ids.h>
 #include <libcamera/controls.h>
 #include <libcamera/formats.h>
+#include <libcamera/framebuffer.h>
+#include <libcamera/geometry.h>
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 
@@ -417,7 +420,7 @@ int PipelineHandlerVimc::processControls(VimcCameraData *data, Request *request)
 			continue;
 		}
 
-		int32_t value = lroundf(it.second.get<float>() * 128 + offset);
+		int32_t value = std::lround(it.second.get<float>() * 128 + offset);
 		controls.set(cid, std::clamp(value, 0, 255));
 	}
 

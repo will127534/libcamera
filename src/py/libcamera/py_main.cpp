@@ -85,14 +85,6 @@ PYBIND11_DECLARE_HOLDER_TYPE(T, PyCameraSmartPtr<T>)
  */
 static std::weak_ptr<PyCameraManager> gCameraManager;
 
-void init_py_color_space(py::module &m);
-void init_py_controls_generated(py::module &m);
-void init_py_enums(py::module &m);
-void init_py_formats_generated(py::module &m);
-void init_py_geometry(py::module &m);
-void init_py_properties_generated(py::module &m);
-void init_py_transform(py::module &m);
-
 PYBIND11_MODULE(_libcamera, m)
 {
 	init_py_enums(m);
@@ -407,12 +399,14 @@ PYBIND11_MODULE(_libcamera, m)
 	pyControlId
 		.def_property_readonly("id", &ControlId::id)
 		.def_property_readonly("name", &ControlId::name)
+		.def_property_readonly("vendor", &ControlId::vendor)
 		.def_property_readonly("type", &ControlId::type)
 		.def("__str__", [](const ControlId &self) { return self.name(); })
 		.def("__repr__", [](const ControlId &self) {
-			return py::str("libcamera.ControlId({}, {}, {})")
-				.format(self.id(), self.name(), self.type());
-		});
+			return py::str("libcamera.ControlId({}, {}.{}, {})")
+				.format(self.id(), self.vendor(), self.name(), self.type());
+		})
+		.def("enumerators", &ControlId::enumerators);
 
 	pyControlInfo
 		.def_property_readonly("min", [](const ControlInfo &self) {

@@ -18,6 +18,7 @@
 #include <QMap>
 #include <QMutexLocker>
 #include <QPainter>
+#include <QResizeEvent>
 #include <QtDebug>
 
 #include "../common/image.h"
@@ -26,23 +27,23 @@
 
 static const QMap<libcamera::PixelFormat, QImage::Format> nativeFormats
 {
-#if QT_VERSION >= QT_VERSION_CHECK(5, 2, 0)
 	{ libcamera::formats::ABGR8888, QImage::Format_RGBX8888 },
 	{ libcamera::formats::XBGR8888, QImage::Format_RGBX8888 },
-#endif
 	{ libcamera::formats::ARGB8888, QImage::Format_RGB32 },
 	{ libcamera::formats::XRGB8888, QImage::Format_RGB32 },
-#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
 	{ libcamera::formats::RGB888, QImage::Format_BGR888 },
-#endif
 	{ libcamera::formats::BGR888, QImage::Format_RGB888 },
 	{ libcamera::formats::RGB565, QImage::Format_RGB16 },
 };
 
 ViewFinderQt::ViewFinderQt(QWidget *parent)
-	: QWidget(parent), buffer_(nullptr)
+	: QWidget(parent), place_(rect()), buffer_(nullptr)
 {
 	icon_ = QIcon(":camera-off.svg");
+
+	QPalette pal = palette();
+	pal.setColor(QPalette::Window, Qt::black);
+	setPalette(pal);
 }
 
 ViewFinderQt::~ViewFinderQt()
@@ -117,6 +118,11 @@ void ViewFinderQt::render(libcamera::FrameBuffer *buffer, Image *image)
 		}
 	}
 
+	/*
+	 * Indicate the widget paints all its pixels, to optimize rendering by
+	 * skipping erasing the widget before painting.
+	 */
+	setAttribute(Qt::WA_OpaquePaintEvent, true);
 	update();
 
 	if (buffer)
@@ -132,6 +138,11 @@ void ViewFinderQt::stop()
 		buffer_ = nullptr;
 	}
 
+	/*
+	 * The logo has a transparent background, reenable erasing the widget
+	 * before painting.
+	 */
+	setAttribute(Qt::WA_OpaquePaintEvent, false);
 	update();
 }
 
@@ -146,9 +157,23 @@ void ViewFinderQt::paintEvent(QPaintEvent *)
 {
 	QPainter painter(this);
 
-	/* If we have an image, draw it. */
+	painter.setBrush(palette().window());
+
+	/* If we have an image, draw it, with black letterbox rectangles. */
 	if (!image_.isNull()) {
-		painter.drawImage(rect(), image_, image_.rect());
+		if (place_.width() < width()) {
+			QRect rect{ 0, 0, (width() - place_.width()) / 2, height() };
+			painter.drawRect(rect);
+			rect.moveLeft(place_.right());
+			painter.drawRect(rect);
+		} else {
+			QRect rect{ 0, 0, width(), (height() - place_.height()) / 2 };
+			painter.drawRect(rect);
+			rect.moveTop(place_.bottom());
+			painter.drawRect(rect);
+		}
+
+		painter.drawImage(place_, image_, image_.rect());
 		return;
 	}
 
@@ -173,11 +198,21 @@ void ViewFinderQt::paintEvent(QPaintEvent *)
 	else
 		point.setY((height() - pixmap_.height()) / 2);
 
-	painter.setBackgroundMode(Qt::OpaqueMode);
 	painter.drawPixmap(point, pixmap_);
 }
 
 QSize ViewFinderQt::sizeHint() const
 {
 	return size_.isValid() ? size_ : QSize(640, 480);
+}
+
+void ViewFinderQt::resizeEvent(QResizeEvent *event)
+{
+	if (!size_.isValid())
+		return;
+
+	place_.setSize(size_.scaled(event->size(), Qt::KeepAspectRatio));
+	place_.moveCenter(rect().center());
+
+	QWidget::resizeEvent(event);
 }

@@ -6,9 +6,10 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
-#include <math.h>
 #include <numeric>
+#include <vector>
 
 #include <libcamera/base/log.h>
 #include <libcamera/base/span.h>
@@ -251,12 +252,12 @@ static bool compareModes(CameraMode const &cm0, CameraMode const &cm1)
 	 */
 	if (cm0.transform != cm1.transform)
 		return true;
-	int leftDiff = abs(cm0.cropX - cm1.cropX);
-	int topDiff = abs(cm0.cropY - cm1.cropY);
-	int rightDiff = fabs(cm0.cropX + cm0.scaleX * cm0.width -
-			     cm1.cropX - cm1.scaleX * cm1.width);
-	int bottomDiff = fabs(cm0.cropY + cm0.scaleY * cm0.height -
-			      cm1.cropY - cm1.scaleY * cm1.height);
+	int leftDiff = std::abs(cm0.cropX - cm1.cropX);
+	int topDiff = std::abs(cm0.cropY - cm1.cropY);
+	int rightDiff = std::abs(cm0.cropX + cm0.scaleX * cm0.width -
+				 cm1.cropX - cm1.scaleX * cm1.width);
+	int bottomDiff = std::abs(cm0.cropY + cm0.scaleY * cm0.height -
+				  cm1.cropY - cm1.scaleY * cm1.height);
 	/*
 	 * These thresholds are a rather arbitrary amount chosen to trigger
 	 * when carrying on with the previously calculated tables might be
@@ -496,8 +497,9 @@ void resampleCalTable(const Array2D<double> &calTableIn,
 	 * Precalculate and cache the x sampling locations and phases to save
 	 * recomputing them on every row.
 	 */
-	int xLo[X], xHi[X];
-	double xf[X];
+	std::vector<int> xLo(X);
+	std::vector<int> xHi(X);
+	std::vector<double> xf(X);
 	double scaleX = cameraMode.sensorWidth /
 			(cameraMode.width * cameraMode.scaleX);
 	double xOff = cameraMode.cropX / (double)cameraMode.sensorWidth;
@@ -730,7 +732,7 @@ static double gaussSeidel2Sor(const SparseArray<double> &M, double omega,
 	double maxDiff = 0;
 	for (i = 0; i < XY; i++) {
 		lambda[i] = oldLambda[i] + (lambda[i] - oldLambda[i]) * omega;
-		if (fabs(lambda[i] - oldLambda[i]) > fabs(maxDiff))
+		if (std::abs(lambda[i] - oldLambda[i]) > std::abs(maxDiff))
 			maxDiff = lambda[i] - oldLambda[i];
 	}
 	return maxDiff;
@@ -762,7 +764,7 @@ static void runMatrixIterations(const Array2D<double> &C,
 	constructM(C, W, M);
 	double lastMaxDiff = std::numeric_limits<double>::max();
 	for (unsigned int i = 0; i < nIter; i++) {
-		double maxDiff = fabs(gaussSeidel2Sor(M, omega, lambda, lambdaBound));
+		double maxDiff = std::abs(gaussSeidel2Sor(M, omega, lambda, lambdaBound));
 		if (maxDiff < threshold) {
 			LOG(RPiAlsc, Debug)
 				<< "Stop after " << i + 1 << " iterations";

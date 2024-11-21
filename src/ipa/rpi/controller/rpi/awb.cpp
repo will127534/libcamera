@@ -6,6 +6,7 @@
  */
 
 #include <assert.h>
+#include <cmath>
 #include <functional>
 
 #include <libcamera/base/log.h>
@@ -19,6 +20,8 @@ using namespace RPiController;
 using namespace libcamera;
 
 LOG_DEFINE_CATEGORY(RPiAwb)
+
+constexpr double kDefaultCT = 4500.0;
 
 #define NAME "rpi.awb"
 
@@ -49,7 +52,8 @@ int AwbPrior::read(const libcamera::YamlObject &params)
 		return -EINVAL;
 	lux = *value;
 
-	return prior.readYaml(params["prior"]);
+	prior = params["prior"].get<ipa::Pwl>(ipa::Pwl{});
+	return prior.empty() ? -EINVAL : 0;
 }
 
 static int readCtCurve(ipa::Pwl &ctR, ipa::Pwl &ctB, const libcamera::YamlObject &params)
@@ -121,7 +125,7 @@ int AwbConfig::read(const libcamera::YamlObject &params)
 		}
 		if (priors.empty()) {
 			LOG(RPiAwb, Error) << "AwbConfig: no AWB priors configured";
-			return ret;
+			return -EINVAL;
 		}
 	}
 	if (params.contains("modes")) {
@@ -166,6 +170,14 @@ int AwbConfig::read(const libcamera::YamlObject &params)
 	whitepointB = params["whitepoint_b"].get<double>(0.0);
 	if (bayes == false)
 		sensitivityR = sensitivityB = 1.0; /* nor do sensitivities make any sense */
+	/*
+	 * The biasProportion parameter adds a small proportion of the counted
+	 * pixles to a region biased to the biasCT colour temperature.
+	 *
+	 * A typical value for biasProportion would be between 0.05 to 0.1.
+	 */
+	biasProportion = params["bias_proportion"].get<double>(0.0);
+	biasCT = params["bias_ct"].get<double>(kDefaultCT);
 	return 0;
 }
 
@@ -213,7 +225,7 @@ void Awb::initialise()
 		syncResults_.gainB = 1.0 / config_.ctB.eval(syncResults_.temperatureK);
 	} else {
 		/* random values just to stop the world blowing up */
-		syncResults_.temperatureK = 4500;
+		syncResults_.temperatureK = kDefaultCT;
 		syncResults_.gainR = syncResults_.gainG = syncResults_.gainB = 1.0;
 	}
 	prevSyncResults_ = syncResults_;
@@ -406,7 +418,8 @@ void Awb::asyncFunc()
 
 static void generateStats(std::vector<Awb::RGB> &zones,
 			  StatisticsPtr &stats, double minPixels,
-			  double minG, Metadata &globalMetadata)
+			  double minG, Metadata &globalMetadata,
+			  double biasProportion, double biasCtR, double biasCtB)
 {
 	std::scoped_lock<RPiController::Metadata> l(globalMetadata);
 
@@ -419,6 +432,14 @@ static void generateStats(std::vector<Awb::RGB> &zones,
 				continue;
 			zone.R = region.val.rSum / region.counted;
 			zone.B = region.val.bSum / region.counted;
+			/*
+			 * Add some bias samples to allow the search to tend to a
+			 * bias CT in failure cases.
+			 */
+			const unsigned int proportion = biasProportion * region.counted;
+			zone.R += proportion * biasCtR;
+			zone.B += proportion * biasCtB;
+			zone.G += proportion * 1.0;
 			/* Factor in the ALSC applied colour shading correction if required. */
 			const AlscStatus *alscStatus = globalMetadata.getLocked<AlscStatus>("alsc.status");
 			if (stats->colourStatsPos == Statistics::ColourStatsPos::PreLsc && alscStatus) {
@@ -438,8 +459,11 @@ void Awb::prepareStats()
 	 * LSC has already been applied to the stats in this pipeline, so stop
 	 * any LSC compensation.  We also ignore config_.fast in this version.
 	 */
+	const double biasCtR = config_.bayes ? config_.ctR.eval(config_.biasCT) : 0;
+	const double biasCtB = config_.bayes ? config_.ctB.eval(config_.biasCT) : 0;
 	generateStats(zones_, statistics_, config_.minPixels,
-		      config_.minG, getGlobalMetadata());
+		      config_.minG, getGlobalMetadata(),
+		      config_.biasProportion, biasCtR, biasCtB);
 	/*
 	 * apply sensitivities, so values appear to come from our "canonical"
 	 * sensor.
@@ -504,7 +528,7 @@ static double interpolateQuadatric(ipa::Pwl::Point const &a, ipa::Pwl::Point con
 	const double eps = 1e-3;
 	ipa::Pwl::Point ca = c - a, ba = b - a;
 	double denominator = 2 * (ba.y() * ca.x() - ca.y() * ba.x());
-	if (abs(denominator) > eps) {
+	if (std::abs(denominator) > eps) {
 		double numerator = ba.y() * ca.x() * ca.x() - ca.y() * ba.x() * ba.x();
 		double result = numerator / denominator + a.x();
 		return std::max(a.x(), std::min(c.x(), result));
@@ -715,7 +739,11 @@ void Awb::awbGrey()
 		sumR += *ri, sumB += *bi;
 	double gainR = sumR.G / (sumR.R + 1),
 	       gainB = sumB.G / (sumB.B + 1);
-	asyncResults_.temperatureK = 4500; /* don't know what it is */
+	/*
+	 * The grey world model can't estimate the colour temperature, use a
+	 * default value.
+	 */
+	asyncResults_.temperatureK = kDefaultCT;
 	asyncResults_.gainR = gainR;
 	asyncResults_.gainG = 1.0;
 	asyncResults_.gainB = gainB;

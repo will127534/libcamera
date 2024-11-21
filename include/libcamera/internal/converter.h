@@ -14,9 +14,11 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <libcamera/base/class.h>
+#include <libcamera/base/flags.h>
 #include <libcamera/base/signal.h>
 
 #include <libcamera/geometry.h>
@@ -26,12 +28,20 @@ namespace libcamera {
 class FrameBuffer;
 class MediaDevice;
 class PixelFormat;
+class Stream;
 struct StreamConfiguration;
 
 class Converter
 {
 public:
-	Converter(MediaDevice *media);
+	enum class Feature {
+		None = 0,
+		InputCrop = (1 << 0),
+	};
+
+	using Features = Flags<Feature>;
+
+	Converter(MediaDevice *media, Features features = Feature::None);
 	virtual ~Converter();
 
 	virtual int loadConfiguration(const std::string &filename) = 0;
@@ -46,19 +56,27 @@ public:
 
 	virtual int configure(const StreamConfiguration &inputCfg,
 			      const std::vector<std::reference_wrapper<StreamConfiguration>> &outputCfgs) = 0;
-	virtual int exportBuffers(unsigned int output, unsigned int count,
+	virtual int exportBuffers(const Stream *stream, unsigned int count,
 				  std::vector<std::unique_ptr<FrameBuffer>> *buffers) = 0;
 
 	virtual int start() = 0;
 	virtual void stop() = 0;
 
 	virtual int queueBuffers(FrameBuffer *input,
-				 const std::map<unsigned int, FrameBuffer *> &outputs) = 0;
+				 const std::map<const Stream *, FrameBuffer *> &outputs) = 0;
+
+	virtual int setInputCrop(const Stream *stream, Rectangle *rect) = 0;
+	virtual std::pair<Rectangle, Rectangle> inputCropBounds(const Stream *stream) = 0;
 
 	Signal<FrameBuffer *> inputBufferReady;
 	Signal<FrameBuffer *> outputBufferReady;
 
 	const std::string &deviceNode() const { return deviceNode_; }
+
+	Features features() const { return features_; }
+
+protected:
+	Features features_;
 
 private:
 	std::string deviceNode_;

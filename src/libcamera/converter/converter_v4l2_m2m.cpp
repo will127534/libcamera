@@ -8,7 +8,6 @@
 
 #include "libcamera/internal/converter/converter_v4l2_m2m.h"
 
-#include <algorithm>
 #include <limits.h>
 
 #include <libcamera/base/log.h>
@@ -23,7 +22,7 @@
 #include "libcamera/internal/v4l2_videodevice.h"
 
 /**
- * \file internal/converter/converter_v4l2_m2m.h
+ * \file converter/converter_v4l2_m2m.h
  * \brief V4L2 M2M based converter
  */
 
@@ -32,24 +31,24 @@ namespace libcamera {
 LOG_DECLARE_CATEGORY(Converter)
 
 /* -----------------------------------------------------------------------------
- * V4L2M2MConverter::Stream
+ * V4L2M2MConverter::V4L2M2MStream
  */
 
-V4L2M2MConverter::Stream::Stream(V4L2M2MConverter *converter, unsigned int index)
-	: converter_(converter), index_(index)
+V4L2M2MConverter::V4L2M2MStream::V4L2M2MStream(V4L2M2MConverter *converter, const Stream *stream)
+	: converter_(converter), stream_(stream)
 {
 	m2m_ = std::make_unique<V4L2M2MDevice>(converter->deviceNode());
 
-	m2m_->output()->bufferReady.connect(this, &Stream::outputBufferReady);
-	m2m_->capture()->bufferReady.connect(this, &Stream::captureBufferReady);
+	m2m_->output()->bufferReady.connect(this, &V4L2M2MStream::outputBufferReady);
+	m2m_->capture()->bufferReady.connect(this, &V4L2M2MStream::captureBufferReady);
 
 	int ret = m2m_->open();
 	if (ret < 0)
 		m2m_.reset();
 }
 
-int V4L2M2MConverter::Stream::configure(const StreamConfiguration &inputCfg,
-					const StreamConfiguration &outputCfg)
+int V4L2M2MConverter::V4L2M2MStream::configure(const StreamConfiguration &inputCfg,
+					       const StreamConfiguration &outputCfg)
 {
 	V4L2PixelFormat videoFormat =
 		m2m_->output()->toV4L2PixelFormat(inputCfg.pixelFormat);
@@ -98,16 +97,54 @@ int V4L2M2MConverter::Stream::configure(const StreamConfiguration &inputCfg,
 	inputBufferCount_ = inputCfg.bufferCount;
 	outputBufferCount_ = outputCfg.bufferCount;
 
+	if (converter_->features() & Feature::InputCrop) {
+		Rectangle minCrop;
+		Rectangle maxCrop;
+
+		/* Find crop bounds */
+		minCrop.width = 1;
+		minCrop.height = 1;
+		maxCrop.width = UINT_MAX;
+		maxCrop.height = UINT_MAX;
+
+		ret = setInputSelection(V4L2_SEL_TGT_CROP, &minCrop);
+		if (ret) {
+			LOG(Converter, Error)
+				<< "Could not query minimum selection crop: "
+				<< strerror(-ret);
+			return ret;
+		}
+
+		ret = getInputSelection(V4L2_SEL_TGT_CROP_BOUNDS, &maxCrop);
+		if (ret) {
+			LOG(Converter, Error)
+				<< "Could not query maximum selection crop: "
+				<< strerror(-ret);
+			return ret;
+		}
+
+		/* Reset the crop to its maximum */
+		ret = setInputSelection(V4L2_SEL_TGT_CROP, &maxCrop);
+		if (ret) {
+			LOG(Converter, Error)
+				<< "Could not reset selection crop: "
+				<< strerror(-ret);
+			return ret;
+		}
+
+		inputCropBounds_ = { minCrop, maxCrop };
+	}
+
 	return 0;
 }
 
-int V4L2M2MConverter::Stream::exportBuffers(unsigned int count,
-					    std::vector<std::unique_ptr<FrameBuffer>> *buffers)
+int V4L2M2MConverter::V4L2M2MStream::exportBuffers(unsigned int count,
+						   std::vector<std::unique_ptr<FrameBuffer>> *buffers)
 {
 	return m2m_->capture()->exportBuffers(count, buffers);
 }
 
-int V4L2M2MConverter::Stream::start()
+int V4L2M2MConverter::V4L2M2MStream::start()
 {
 	int ret = m2m_->output()->importBuffers(inputBufferCount_);
 	if (ret < 0)
@@ -134,7 +171,7 @@ int V4L2M2MConverter::Stream::start()
 	return 0;
 }
 
-void V4L2M2MConverter::Stream::stop()
+void V4L2M2MConverter::V4L2M2MStream::stop()
 {
 	m2m_->capture()->streamOff();
 	m2m_->output()->streamOff();
@@ -142,7 +179,7 @@ void V4L2M2MConverter::Stream::stop()
 	m2m_->output()->releaseBuffers();
 }
 
-int V4L2M2MConverter::Stream::queueBuffers(FrameBuffer *input, FrameBuffer *output)
+int V4L2M2MConverter::V4L2M2MStream::queueBuffers(FrameBuffer *input, FrameBuffer *output)
 {
 	int ret = m2m_->output()->queueBuffer(input);
 	if (ret < 0)
@@ -155,12 +192,27 @@ int V4L2M2MConverter::Stream::queueBuffers(FrameBuffer *input, FrameBuffer *outp
 	return 0;
 }
 
-std::string V4L2M2MConverter::Stream::logPrefix() const
+int V4L2M2MConverter::V4L2M2MStream::getInputSelection(unsigned int target, Rectangle *rect)
 {
-	return "stream" + std::to_string(index_);
+	return m2m_->output()->getSelection(target, rect);
 }
 
-void V4L2M2MConverter::Stream::outputBufferReady(FrameBuffer *buffer)
+int V4L2M2MConverter::V4L2M2MStream::setInputSelection(unsigned int target, Rectangle *rect)
+{
+	return m2m_->output()->setSelection(target, rect);
+}
+
+std::pair<Rectangle, Rectangle> V4L2M2MConverter::V4L2M2MStream::inputCropBounds()
+{
+	return inputCropBounds_;
+}
+
+std::string V4L2M2MConverter::V4L2M2MStream::logPrefix() const
+{
+	return stream_->configuration().toString();
+}
+
+void V4L2M2MConverter::V4L2M2MStream::outputBufferReady(FrameBuffer *buffer)
 {
 	auto it = converter_->queue_.find(buffer);
 	if (it == converter_->queue_.end())
@@ -172,7 +224,7 @@ void V4L2M2MConverter::Stream::outputBufferReady(FrameBuffer *buffer)
 	}
 }
 
-void V4L2M2MConverter::Stream::captureBufferReady(FrameBuffer *buffer)
+void V4L2M2MConverter::V4L2M2MStream::captureBufferReady(FrameBuffer *buffer)
 {
 	converter_->outputBufferReady.emit(buffer);
 }
@@ -204,6 +256,33 @@ V4L2M2MConverter::V4L2M2MConverter(MediaDevice *media)
 	if (ret < 0) {
 		m2m_.reset();
 		return;
+	}
+
+	/* Discover Feature::InputCrop */
+	Rectangle maxCrop;
+	maxCrop.width = UINT_MAX;
+	maxCrop.height = UINT_MAX;
+
+	ret = m2m_->output()->setSelection(V4L2_SEL_TGT_CROP, &maxCrop);
+	if (ret)
+		return;
+
+	/*
+	 * Rectangles for cropping targets are defined even if the device
+	 * does not support cropping. Their sizes and positions will be
+	 * fixed in such cases.
+	 *
+	 * Set and inspect a crop equivalent to half of the maximum crop
+	 * returned earlier. Use this to determine whether the crop on
+	 * input is really supported.
+	 */
+	Rectangle halfCrop(maxCrop.size() / 2);
+	ret = m2m_->output()->setSelection(V4L2_SEL_TGT_CROP, &halfCrop);
+	if (!ret && halfCrop != maxCrop) {
+		features_ |= Feature::InputCrop;
+
+		LOG(Converter, Info)
+			<< "Converter supports cropping on its input";
 	}
 }
 
@@ -333,21 +412,24 @@ int V4L2M2MConverter::configure(const StreamConfiguration &inputCfg,
 	int ret = 0;
 
 	streams_.clear();
-	streams_.reserve(outputCfgs.size());
 
 	for (unsigned int i = 0; i < outputCfgs.size(); ++i) {
-		Stream &stream = streams_.emplace_back(this, i);
+		const StreamConfiguration &cfg = outputCfgs[i];
+		std::unique_ptr<V4L2M2MStream> stream =
+			std::make_unique<V4L2M2MStream>(this, cfg.stream());
 
-		if (!stream.isValid()) {
+		if (!stream->isValid()) {
 			LOG(Converter, Error)
 				<< "Failed to create stream " << i;
 			ret = -EINVAL;
 			break;
 		}
 
-		ret = stream.configure(inputCfg, outputCfgs[i]);
+		ret = stream->configure(inputCfg, cfg);
 		if (ret < 0)
 			break;
+
+		streams_.emplace(cfg.stream(), std::move(stream));
 	}
 
 	if (ret < 0) {
@@ -361,13 +443,44 @@ int V4L2M2MConverter::configure(const StreamConfiguration &inputCfg,
 /**
  * \copydoc libcamera::Converter::exportBuffers
  */
-int V4L2M2MConverter::exportBuffers(unsigned int output, unsigned int count,
+int V4L2M2MConverter::exportBuffers(const Stream *stream, unsigned int count,
 				    std::vector<std::unique_ptr<FrameBuffer>> *buffers)
 {
-	if (output >= streams_.size())
+	auto iter = streams_.find(stream);
+	if (iter == streams_.end())
 		return -EINVAL;
 
-	return streams_[output].exportBuffers(count, buffers);
+	return iter->second->exportBuffers(count, buffers);
+}
+
+/**
+ * \copydoc libcamera::Converter::setInputCrop
+ */
+int V4L2M2MConverter::setInputCrop(const Stream *stream, Rectangle *rect)
+{
+	if (!(features_ & Feature::InputCrop))
+		return -ENOTSUP;
+
+	auto iter = streams_.find(stream);
+	if (iter == streams_.end()) {
+		LOG(Converter, Error) << "Invalid output stream";
+		return -EINVAL;
+	}
+
+	return iter->second->setInputSelection(V4L2_SEL_TGT_CROP, rect);
+}
+
+/**
+ * \copydoc libcamera::Converter::inputCropBounds
+ */
+std::pair<Rectangle, Rectangle>
+V4L2M2MConverter::inputCropBounds(const Stream *stream)
+{
+	auto iter = streams_.find(stream);
+	if (iter == streams_.end())
+		return {};
+
+	return iter->second->inputCropBounds();
 }
 
 /**
@@ -377,8 +490,8 @@ int V4L2M2MConverter::start()
 {
 	int ret;
 
-	for (Stream &stream : streams_) {
-		ret = stream.start();
+	for (auto &iter : streams_) {
+		ret = iter.second->start();
 		if (ret < 0) {
 			stop();
 			return ret;
@@ -393,41 +506,40 @@ int V4L2M2MConverter::start()
  */
 void V4L2M2MConverter::stop()
 {
-	for (Stream &stream : utils::reverse(streams_))
-		stream.stop();
+	for (auto &iter : streams_)
+		iter.second->stop();
 }
 
 /**
  * \copydoc libcamera::Converter::queueBuffers
  */
 int V4L2M2MConverter::queueBuffers(FrameBuffer *input,
-				   const std::map<unsigned int, FrameBuffer *> &outputs)
+				   const std::map<const Stream *, FrameBuffer *> &outputs)
 {
-	unsigned int mask = 0;
+	std::set<FrameBuffer *> outputBufs;
 	int ret;
 
 	/*
 	 * Validate the outputs as a sanity check: at least one output is
 	 * required, all outputs must reference a valid stream and no two
-	 * outputs can reference the same stream.
+	 * streams can reference same output framebuffers.
 	 */
 	if (outputs.empty())
 		return -EINVAL;
 
-	for (auto [index, buffer] : outputs) {
+	for (auto [stream, buffer] : outputs) {
 		if (!buffer)
 			return -EINVAL;
-		if (index >= streams_.size())
-			return -EINVAL;
-		if (mask & (1 << index))
-			return -EINVAL;
 
-		mask |= 1 << index;
+		outputBufs.insert(buffer);
 	}
 
+	if (outputBufs.size() != streams_.size())
+		return -EINVAL;
+
 	/* Queue the input and output buffers to all the streams. */
-	for (auto [index, buffer] : outputs) {
-		ret = streams_[index].queueBuffers(input, buffer);
+	for (auto [stream, buffer] : outputs) {
+		ret = streams_.at(stream)->queueBuffers(input, buffer);
 		if (ret < 0)
 			return ret;
 	}
@@ -444,6 +556,10 @@ int V4L2M2MConverter::queueBuffers(FrameBuffer *input,
 	return 0;
 }
 
+/*
+ * \todo: This should be extended to include Feature::Flag to denote
+ * what each converter supports feature-wise.
+ */
 static std::initializer_list<std::string> compatibles = {
 	"mtk-mdp",
 	"pxp",

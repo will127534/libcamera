@@ -28,7 +28,9 @@ class FrameBuffer;
 class MediaDevice;
 class Size;
 class SizeRange;
+class Stream;
 struct StreamConfiguration;
+class Rectangle;
 class V4L2M2MDevice;
 
 class V4L2M2MConverter : public Converter
@@ -47,20 +49,23 @@ public:
 
 	int configure(const StreamConfiguration &inputCfg,
 		      const std::vector<std::reference_wrapper<StreamConfiguration>> &outputCfg);
-	int exportBuffers(unsigned int output, unsigned int count,
+	int exportBuffers(const Stream *stream, unsigned int count,
 			  std::vector<std::unique_ptr<FrameBuffer>> *buffers);
 
 	int start();
 	void stop();
 
 	int queueBuffers(FrameBuffer *input,
-			 const std::map<unsigned int, FrameBuffer *> &outputs);
+			 const std::map<const Stream *, FrameBuffer *> &outputs);
+
+	int setInputCrop(const Stream *stream, Rectangle *rect);
+	std::pair<Rectangle, Rectangle> inputCropBounds(const Stream *stream);
 
 private:
-	class Stream : protected Loggable
+	class V4L2M2MStream : protected Loggable
 	{
 	public:
-		Stream(V4L2M2MConverter *converter, unsigned int index);
+		V4L2M2MStream(V4L2M2MConverter *converter, const Stream *stream);
 
 		bool isValid() const { return m2m_ != nullptr; }
 
@@ -74,6 +79,11 @@ private:
 
 		int queueBuffers(FrameBuffer *input, FrameBuffer *output);
 
+		int setInputSelection(unsigned int target, Rectangle *rect);
+		int getInputSelection(unsigned int target, Rectangle *rect);
+
+		std::pair<Rectangle, Rectangle> inputCropBounds();
+
 	protected:
 		std::string logPrefix() const override;
 
@@ -82,16 +92,18 @@ private:
 		void outputBufferReady(FrameBuffer *buffer);
 
 		V4L2M2MConverter *converter_;
-		unsigned int index_;
+		const Stream *stream_;
 		std::unique_ptr<V4L2M2MDevice> m2m_;
 
 		unsigned int inputBufferCount_;
 		unsigned int outputBufferCount_;
+
+		std::pair<Rectangle, Rectangle> inputCropBounds_;
 	};
 
 	std::unique_ptr<V4L2M2MDevice> m2m_;
 
-	std::vector<Stream> streams_;
+	std::map<const Stream *, std::unique_ptr<V4L2M2MStream>> streams_;
 	std::map<FrameBuffer *, unsigned int> queue_;
 };
 

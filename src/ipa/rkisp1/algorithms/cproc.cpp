@@ -33,29 +33,28 @@ namespace ipa::rkisp1::algorithms {
 
 LOG_DEFINE_CATEGORY(RkISP1CProc)
 
+namespace {
+
 constexpr float kDefaultBrightness = 0.0f;
 constexpr float kDefaultContrast = 1.0f;
 constexpr float kDefaultSaturation = 1.0f;
 
-static int convertBrightness(const float v)
+int convertBrightness(const float v)
 {
 	return std::clamp<int>(std::lround(v * 128), -128, 127);
 }
 
-static int convertContrast(const float v)
+int convertContrastOrSaturation(const float v)
 {
 	return std::clamp<int>(std::lround(v * 128), 0, 255);
 }
 
-static int convertSaturation(const float v)
-{
-	return std::clamp<int>(std::lround(v * 128), 0, 255);
-}
+} /* namespace */
 
 /**
  * \copydoc libcamera::ipa::Algorithm::init
  */
-int ColorProcessing::init([[maybe_unused]] IPAContext &context,
+int ColorProcessing::init(IPAContext &context,
 			  [[maybe_unused]] const YamlObject &tuningData)
 {
 	auto &cmap = context.ctrlMap;
@@ -70,14 +69,14 @@ int ColorProcessing::init([[maybe_unused]] IPAContext &context,
 /**
  * \copydoc libcamera::ipa::Algorithm::configure
  */
-int ColorProcessing::configure([[maybe_unused]] IPAContext &context,
+int ColorProcessing::configure(IPAContext &context,
 			       [[maybe_unused]] const IPACameraSensorInfo &configInfo)
 {
 	auto &cproc = context.activeState.cproc;
 
 	cproc.brightness = convertBrightness(kDefaultBrightness);
-	cproc.contrast = convertContrast(kDefaultContrast);
-	cproc.saturation = convertSaturation(kDefaultSaturation);
+	cproc.contrast = convertContrastOrSaturation(kDefaultContrast);
+	cproc.saturation = convertContrastOrSaturation(kDefaultSaturation);
 
 	return 0;
 }
@@ -86,7 +85,7 @@ int ColorProcessing::configure([[maybe_unused]] IPAContext &context,
  * \copydoc libcamera::ipa::Algorithm::queueRequest
  */
 void ColorProcessing::queueRequest(IPAContext &context,
-				   [[maybe_unused]] const uint32_t frame,
+				   const uint32_t frame,
 				   IPAFrameContext &frameContext,
 				   const ControlList &controls)
 {
@@ -109,7 +108,7 @@ void ColorProcessing::queueRequest(IPAContext &context,
 
 	const auto &contrast = controls.get(controls::Contrast);
 	if (contrast) {
-		int value = convertContrast(*contrast);
+		int value = convertContrastOrSaturation(*contrast);
 		if (cproc.contrast != value) {
 			cproc.contrast = value;
 			update = true;
@@ -120,7 +119,7 @@ void ColorProcessing::queueRequest(IPAContext &context,
 
 	const auto saturation = controls.get(controls::Saturation);
 	if (saturation) {
-		int value = convertSaturation(*saturation);
+		int value = convertContrastOrSaturation(*saturation);
 		if (cproc.saturation != value) {
 			cproc.saturation = value;
 			update = true;
@@ -141,19 +140,17 @@ void ColorProcessing::queueRequest(IPAContext &context,
 void ColorProcessing::prepare([[maybe_unused]] IPAContext &context,
 			      [[maybe_unused]] const uint32_t frame,
 			      IPAFrameContext &frameContext,
-			      rkisp1_params_cfg *params)
+			      RkISP1Params *params)
 {
 	/* Check if the algorithm configuration has been updated. */
 	if (!frameContext.cproc.update)
 		return;
 
-	params->others.cproc_config.brightness = frameContext.cproc.brightness;
-	params->others.cproc_config.contrast = frameContext.cproc.contrast;
-	params->others.cproc_config.sat = frameContext.cproc.saturation;
-
-	params->module_en_update |= RKISP1_CIF_ISP_MODULE_CPROC;
-	params->module_ens |= RKISP1_CIF_ISP_MODULE_CPROC;
-	params->module_cfg_update |= RKISP1_CIF_ISP_MODULE_CPROC;
+	auto config = params->block<BlockType::Cproc>();
+	config.setEnabled(true);
+	config->brightness = frameContext.cproc.brightness;
+	config->contrast = frameContext.cproc.contrast;
+	config->sat = frameContext.cproc.saturation;
 }
 
 REGISTER_IPA_ALGORITHM(ColorProcessing, "ColorProcessing")

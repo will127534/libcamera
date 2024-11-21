@@ -7,9 +7,9 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <memory>
+#include <optional>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
@@ -25,6 +25,7 @@ public:
 	CameraSensorHelper() = default;
 	virtual ~CameraSensorHelper() = default;
 
+	std::optional<int16_t> blackLevel() const { return blackLevel_; }
 	virtual uint32_t gainCode(double gain) const;
 	virtual double gain(uint32_t gainCode) const;
 
@@ -51,6 +52,7 @@ protected:
 		AnalogueGainExpConstants exp;
 	};
 
+	std::optional<int16_t> blackLevel_;
 	AnalogueGainType gainType_;
 	AnalogueGainConstants gainConstants_;
 

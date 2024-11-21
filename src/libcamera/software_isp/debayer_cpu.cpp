@@ -12,7 +12,10 @@
 #include "debayer_cpu.h"
 
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <time.h>
+
+#include <linux/dma-buf.h>
 
 #include <libcamera/formats.h>
 
@@ -49,16 +52,9 @@ DebayerCpu::DebayerCpu(std::unique_ptr<SwStatsCpu> stats)
 	/* Initialize color lookup tables */
 	for (unsigned int i = 0; i < DebayerParams::kRGBLookupSize; i++)
 		red_[i] = green_[i] = blue_[i] = i;
-
-	for (unsigned int i = 0; i < kMaxLineBuffers; i++)
-		lineBuffers_[i] = nullptr;
 }
 
-DebayerCpu::~DebayerCpu()
-{
-	for (unsigned int i = 0; i < kMaxLineBuffers; i++)
-		free(lineBuffers_[i]);
-}
+DebayerCpu::~DebayerCpu() = default;
 
 #define DECLARE_SRC_POINTERS(pixel_t)                            \
 	const pixel_t *prev = (const pixel_t *)src[0] + xShift_; \
@@ -74,6 +70,8 @@ DebayerCpu::~DebayerCpu()
 	*dst++ = blue_[curr[x] / (div)];                                                      \
 	*dst++ = green_[(prev[x] + curr[x - p] + curr[x + n] + next[x]) / (4 * (div))];       \
 	*dst++ = red_[(prev[x - p] + prev[x + n] + next[x - p] + next[x + n]) / (4 * (div))]; \
+	if constexpr (addAlphaByte)                                                           \
+		*dst++ = 255;                                                                 \
 	x++;
 
 /*
@@ -85,6 +83,8 @@ DebayerCpu::~DebayerCpu()
 	*dst++ = blue_[(prev[x] + next[x]) / (2 * (div))];        \
 	*dst++ = green_[curr[x] / (div)];                         \
 	*dst++ = red_[(curr[x - p] + curr[x + n]) / (2 * (div))]; \
+	if constexpr (addAlphaByte)                               \
+		*dst++ = 255;                                     \
 	x++;
 
 /*
@@ -96,6 +96,8 @@ DebayerCpu::~DebayerCpu()
 	*dst++ = blue_[(curr[x - p] + curr[x + n]) / (2 * (div))]; \
 	*dst++ = green_[curr[x] / (div)];                          \
 	*dst++ = red_[(prev[x] + next[x]) / (2 * (div))];          \
+	if constexpr (addAlphaByte)                                \
+		*dst++ = 255;                                      \
 	x++;
 
 /*
@@ -107,8 +109,11 @@ DebayerCpu::~DebayerCpu()
 	*dst++ = blue_[(prev[x - p] + prev[x + n] + next[x - p] + next[x + n]) / (4 * (div))]; \
 	*dst++ = green_[(prev[x] + curr[x - p] + curr[x + n] + next[x]) / (4 * (div))];        \
 	*dst++ = red_[curr[x] / (div)];                                                        \
+	if constexpr (addAlphaByte)                                                            \
+		*dst++ = 255;                                                                  \
 	x++;
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint8_t)
@@ -119,6 +124,7 @@ void DebayerCpu::debayer8_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint8_t)
@@ -129,6 +135,7 @@ void DebayerCpu::debayer8_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint16_t)
@@ -140,6 +147,7 @@ void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint16_t)
@@ -151,6 +159,7 @@ void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint16_t)
@@ -162,6 +171,7 @@ void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	DECLARE_SRC_POINTERS(uint16_t)
@@ -173,6 +183,7 @@ void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	const int widthInBytes = window_.width * 5 / 4;
@@ -198,6 +209,7 @@ void DebayerCpu::debayer10P_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	const int widthInBytes = window_.width * 5 / 4;
@@ -218,6 +230,7 @@ void DebayerCpu::debayer10P_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	const int widthInBytes = window_.width * 5 / 4;
@@ -238,6 +251,7 @@ void DebayerCpu::debayer10P_GBGB_BGR888(uint8_t *dst, const uint8_t *src[])
 	}
 }
 
+template<bool addAlphaByte>
 void DebayerCpu::debayer10P_RGRG_BGR888(uint8_t *dst, const uint8_t *src[])
 {
 	const int widthInBytes = window_.width * 5 / 4;
@@ -280,7 +294,12 @@ int DebayerCpu::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 		config.bpp = (bayerFormat.bitDepth + 7) & ~7;
 		config.patternSize.width = 2;
 		config.patternSize.height = 2;
-		config.outputFormats = std::vector<PixelFormat>({ formats::RGB888, formats::BGR888 });
+		config.outputFormats = std::vector<PixelFormat>({ formats::RGB888,
+								  formats::XRGB8888,
+								  formats::ARGB8888,
+								  formats::BGR888,
+								  formats::XBGR8888,
+								  formats::ABGR8888 });
 		return 0;
 	}
 
@@ -290,7 +309,12 @@ int DebayerCpu::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 		config.bpp = 10;
 		config.patternSize.width = 4; /* 5 bytes per *4* pixels */
 		config.patternSize.height = 2;
-		config.outputFormats = std::vector<PixelFormat>({ formats::RGB888, formats::BGR888 });
+		config.outputFormats = std::vector<PixelFormat>({ formats::RGB888,
+								  formats::XRGB8888,
+								  formats::ARGB8888,
+								  formats::BGR888,
+								  formats::XBGR8888,
+								  formats::ABGR8888 });
 		return 0;
 	}
 
@@ -303,6 +327,12 @@ int DebayerCpu::getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &c
 {
 	if (outputFormat == formats::RGB888 || outputFormat == formats::BGR888) {
 		config.bpp = 24;
+		return 0;
+	}
+
+	if (outputFormat == formats::XRGB8888 || outputFormat == formats::ARGB8888 ||
+	    outputFormat == formats::XBGR8888 || outputFormat == formats::ABGR8888) {
+		config.bpp = 32;
 		return 0;
 	}
 
@@ -341,6 +371,7 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat, PixelFormat outputF
 {
 	BayerFormat bayerFormat =
 		BayerFormat::fromPixelFormat(inputFormat);
+	bool addAlphaByte = false;
 
 	xShift_ = 0;
 	swapRedBlueGains_ = false;
@@ -351,8 +382,16 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat, PixelFormat outputF
 	};
 
 	switch (outputFormat) {
+	case formats::XRGB8888:
+	case formats::ARGB8888:
+		addAlphaByte = true;
+		[[fallthrough]];
 	case formats::RGB888:
 		break;
+	case formats::XBGR8888:
+	case formats::ABGR8888:
+		addAlphaByte = true;
+		[[fallthrough]];
 	case formats::BGR888:
 		/* Swap R and B in bayer order to generate BGR888 instead of RGB888 */
 		swapRedBlueGains_ = true;
@@ -383,16 +422,16 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat, PixelFormat outputF
 	    isStandardBayerOrder(bayerFormat.order)) {
 		switch (bayerFormat.bitDepth) {
 		case 8:
-			debayer0_ = &DebayerCpu::debayer8_BGBG_BGR888;
-			debayer1_ = &DebayerCpu::debayer8_GRGR_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer8_BGBG_BGR888<true> : &DebayerCpu::debayer8_BGBG_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer8_GRGR_BGR888<true> : &DebayerCpu::debayer8_GRGR_BGR888<false>;
 			break;
 		case 10:
-			debayer0_ = &DebayerCpu::debayer10_BGBG_BGR888;
-			debayer1_ = &DebayerCpu::debayer10_GRGR_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer10_BGBG_BGR888<true> : &DebayerCpu::debayer10_BGBG_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer10_GRGR_BGR888<true> : &DebayerCpu::debayer10_GRGR_BGR888<false>;
 			break;
 		case 12:
-			debayer0_ = &DebayerCpu::debayer12_BGBG_BGR888;
-			debayer1_ = &DebayerCpu::debayer12_GRGR_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer12_BGBG_BGR888<true> : &DebayerCpu::debayer12_BGBG_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer12_GRGR_BGR888<true> : &DebayerCpu::debayer12_GRGR_BGR888<false>;
 			break;
 		}
 		setupStandardBayerOrder(bayerFormat.order);
@@ -403,20 +442,20 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat, PixelFormat outputF
 	    bayerFormat.packing == BayerFormat::Packing::CSI2) {
 		switch (bayerFormat.order) {
 		case BayerFormat::BGGR:
-			debayer0_ = &DebayerCpu::debayer10P_BGBG_BGR888;
-			debayer1_ = &DebayerCpu::debayer10P_GRGR_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer10P_BGBG_BGR888<true> : &DebayerCpu::debayer10P_BGBG_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer10P_GRGR_BGR888<true> : &DebayerCpu::debayer10P_GRGR_BGR888<false>;
 			return 0;
 		case BayerFormat::GBRG:
-			debayer0_ = &DebayerCpu::debayer10P_GBGB_BGR888;
-			debayer1_ = &DebayerCpu::debayer10P_RGRG_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer10P_GBGB_BGR888<true> : &DebayerCpu::debayer10P_GBGB_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer10P_RGRG_BGR888<true> : &DebayerCpu::debayer10P_RGRG_BGR888<false>;
 			return 0;
 		case BayerFormat::GRBG:
-			debayer0_ = &DebayerCpu::debayer10P_GRGR_BGR888;
-			debayer1_ = &DebayerCpu::debayer10P_BGBG_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer10P_GRGR_BGR888<true> : &DebayerCpu::debayer10P_GRGR_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer10P_BGBG_BGR888<true> : &DebayerCpu::debayer10P_BGBG_BGR888<false>;
 			return 0;
 		case BayerFormat::RGGB:
-			debayer0_ = &DebayerCpu::debayer10P_RGRG_BGR888;
-			debayer1_ = &DebayerCpu::debayer10P_GBGB_BGR888;
+			debayer0_ = addAlphaByte ? &DebayerCpu::debayer10P_RGRG_BGR888<true> : &DebayerCpu::debayer10P_RGRG_BGR888<false>;
+			debayer1_ = addAlphaByte ? &DebayerCpu::debayer10P_GBGB_BGR888<true> : &DebayerCpu::debayer10P_GBGB_BGR888<false>;
 			return 0;
 		default:
 			break;
@@ -483,13 +522,10 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
 	lineBufferPadding_ = inputConfig_.patternSize.width * inputConfig_.bpp / 8;
 	lineBufferLength_ = window_.width * inputConfig_.bpp / 8 +
 			    2 * lineBufferPadding_;
-	for (unsigned int i = 0;
-	     i < (inputConfig_.patternSize.height + 1) && enableInputMemcpy_;
-	     i++) {
-		free(lineBuffers_[i]);
-		lineBuffers_[i] = (uint8_t *)malloc(lineBufferLength_);
-		if (!lineBuffers_[i])
-			return -ENOMEM;
+
+	if (enableInputMemcpy_) {
+		for (unsigned int i = 0; i <= inputConfig_.patternSize.height; i++)
+			lineBuffers_[i].resize(lineBufferLength_);
 	}
 
 	measuredFrames_ = 0;
@@ -544,9 +580,10 @@ void DebayerCpu::setupInputMemcpy(const uint8_t *linePointers[])
 		return;
 
 	for (unsigned int i = 0; i < patternHeight; i++) {
-		memcpy(lineBuffers_[i], linePointers[i + 1] - lineBufferPadding_,
+		memcpy(lineBuffers_[i].data(),
+		       linePointers[i + 1] - lineBufferPadding_,
 		       lineBufferLength_);
-		linePointers[i + 1] = lineBuffers_[i] + lineBufferPadding_;
+		linePointers[i + 1] = lineBuffers_[i].data() + lineBufferPadding_;
 	}
 
 	/* Point lineBufferIndex_ to first unused lineBuffer */
@@ -571,9 +608,10 @@ void DebayerCpu::memcpyNextLine(const uint8_t *linePointers[])
 	if (!enableInputMemcpy_)
 		return;
 
-	memcpy(lineBuffers_[lineBufferIndex_], linePointers[patternHeight] - lineBufferPadding_,
+	memcpy(lineBuffers_[lineBufferIndex_].data(),
+	       linePointers[patternHeight] - lineBufferPadding_,
 	       lineBufferLength_);
-	linePointers[patternHeight] = lineBuffers_[lineBufferIndex_] + lineBufferPadding_;
+	linePointers[patternHeight] = lineBuffers_[lineBufferIndex_].data() + lineBufferPadding_;
 
 	lineBufferIndex_ = (lineBufferIndex_ + 1) % (patternHeight + 1);
 }
@@ -682,13 +720,34 @@ void DebayerCpu::process4(const uint8_t *src, uint8_t *dst)
 	}
 }
 
-static inline int64_t timeDiff(timespec &after, timespec &before)
+namespace {
+
+void syncBufferForCPU(FrameBuffer *buffer, uint64_t syncFlags)
+{
+	for (const FrameBuffer::Plane &plane : buffer->planes()) {
+		const int fd = plane.fd.get();
+		struct dma_buf_sync sync = { syncFlags };
+		int ret;
+
+		ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+		if (ret < 0) {
+			ret = errno;
+			LOG(Debayer, Error)
+				<< "Syncing buffer FD " << fd << " with flags "
+				<< syncFlags << " failed: " << strerror(ret);
+		}
+	}
+}
+
+inline int64_t timeDiff(timespec &after, timespec &before)
 {
 	return (after.tv_sec - before.tv_sec) * 1000000000LL +
 	       (int64_t)after.tv_nsec - (int64_t)before.tv_nsec;
 }
 
-void DebayerCpu::process(FrameBuffer *input, FrameBuffer *output, DebayerParams params)
+} /* namespace */
+
+void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output, DebayerParams params)
 {
 	timespec frameStartTime;
 
@@ -696,6 +755,9 @@ void DebayerCpu::process(FrameBuffer *input, FrameBuffer *output, DebayerParams 
 		frameStartTime = {};
 		clock_gettime(CLOCK_MONOTONIC_RAW, &frameStartTime);
 	}
+
+	syncBufferForCPU(input, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+	syncBufferForCPU(output, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
 
 	green_ = params.green;
 	red_ = swapRedBlueGains_ ? params.blue : params.red;
@@ -724,6 +786,9 @@ void DebayerCpu::process(FrameBuffer *input, FrameBuffer *output, DebayerParams 
 
 	metadata.planes()[0].bytesused = out.planes()[0].size();
 
+	syncBufferForCPU(output, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+	syncBufferForCPU(input, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+
 	/* Measure before emitting signals */
 	if (measuredFrames_ < DebayerCpu::kLastFrameToMeasure &&
 	    ++measuredFrames_ > DebayerCpu::kFramesToSkip) {
@@ -741,7 +806,12 @@ void DebayerCpu::process(FrameBuffer *input, FrameBuffer *output, DebayerParams 
 		}
 	}
 
-	stats_->finishFrame();
+	/*
+	 * Buffer ids are currently not used, so pass zeros as its parameter.
+	 *
+	 * \todo Pass real bufferId once stats buffer passing is changed.
+	 */
+	stats_->finishFrame(frame, 0);
 	outputBufferReady.emit(output);
 	inputBufferReady.emit(input);
 }
