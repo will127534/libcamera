@@ -17,8 +17,7 @@ public:
 	CamHelperImx294();
 	uint32_t gainCode(double gain) const override;
 	double gain(uint32_t gainCode) const override;
-	void getDelays(int &exposureDelay, int &gainDelay,
-		       int &vblankDelay, int &hblankDelay) const override;
+	unsigned int hideFramesStartup() const override;
 	unsigned int hideFramesModeSwitch() const override;
 
 private:
@@ -49,14 +48,10 @@ double CamHelperImx294::gain(uint32_t gainCode) const
 	return static_cast<double>(2048.0/(2048 - gainCode));
 }
 
-void CamHelperImx294::getDelays(int &exposureDelay, int &gainDelay,
-				int &vblankDelay, int &hblankDelay) const
+unsigned int CamHelperImx294::hideFramesStartup() const
 {
-	/* The driver appears to behave as follows: */
-	exposureDelay = 2;
-	gainDelay = 2;
-	vblankDelay = 2;
-	hblankDelay = 2;
+	/* On startup, we seem to get 1 bad frame. */
+	return 1;
 }
 
 unsigned int CamHelperImx294::hideFramesModeSwitch() const
