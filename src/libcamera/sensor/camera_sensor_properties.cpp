@@ -209,6 +209,16 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.hblankDelay = 2
 			},
 		} },
+                { "imx294", {
+                        .unitCellSize = { 4630, 4630 },
+                        .testPatternModes = {},
+                        .sensorDelays = {
+                                .exposureDelay = 2,
+                                .gainDelay = 2,
+                                .vblankDelay = 2,
+                                .hblankDelay = 2
+                        },
+                } },
 		{ "imx296", {
 			.unitCellSize = { 3450, 3450 },
 			.testPatternModes = {},
@@ -282,6 +292,16 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.hblankDelay = 3
 			},
 		} },
+                { "imx585", {
+                        .unitCellSize = { 2900, 2900 },
+                        .testPatternModes = {},
+                        .sensorDelays = {
+                                .exposureDelay = 2,
+                                .gainDelay = 2,
+                                .vblankDelay = 2,
+                                .hblankDelay = 2
+                        },
+                } },
 		{ "imx708", {
 			.unitCellSize = { 1400, 1400 },
 			.testPatternModes = {
