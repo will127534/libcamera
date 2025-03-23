@@ -1,0 +1,32 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&rp1_clocks>;
+		__overlay__ {
+			/*
+			 * Re-specify the entire assigned-clock-rates array.
+			 * Only the items for RP1_PLL_SYS (index #2) and
+			 * RP1_CLK_SYS (index #7) have been changed to 300000000.
+			 */
+			assigned-clock-rates = <
+				/* RP1_PLL_SYS_CORE  */ 1000000000
+				/* RP1_PLL_AUDIO_CORE*/ 1536000000
+				/* RP1_PLL_SYS       */ 300000000
+				/* RP1_PLL_SYS_SEC   */ 125000000
+				/* RP1_CLK_ETH       */ 125000000
+				/* RP1_PLL_AUDIO     */ 61440000
+				/* RP1_PLL_AUDIO_SEC */ 153600000
+				/* RP1_CLK_SYS       */ 300000000
+				/* RP1_PLL_SYS_PRI_PH*/ 100000000
+				/* RP1_CLK_SLOW_SYS  */ 50000000
+				/* RP1_CLK_SDIO_TIMER*/ 1000000
+				/* RP1_CLK_SDIO_ALT_SRC*/ 200000000
+				/* RP1_CLK_ETH_TSU   */ 50000000
+			>;
+		};
+	};
+};
