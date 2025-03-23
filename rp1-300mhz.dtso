@@ -8,24 +8,38 @@
 		target = <&rp1_clocks>;
 		__overlay__ {
 			/*
-			 * Re-specify the entire assigned-clock-rates array.
-			 * Only the items for RP1_PLL_SYS (index #2) and
-			 * RP1_CLK_SYS (index #7) have been changed to 300000000.
+			 * We must override the entire 'assigned-clock-rates' array.
+			 * The indexes match the 'assigned-clocks' lines in your DTS:
+			 *   Index 0 -> RP1_PLL_SYS_CORE
+			 *   Index 1 -> RP1_PLL_AUDIO_CORE
+			 *   Index 2 -> RP1_PLL_SYS
+			 *   Index 3 -> RP1_PLL_SYS_SEC
+			 *   Index 4 -> RP1_CLK_ETH
+			 *   Index 5 -> RP1_PLL_AUDIO
+			 *   Index 6 -> RP1_PLL_AUDIO_SEC
+			 *   Index 7 -> RP1_CLK_SYS
+			 *   Index 8 -> RP1_PLL_SYS_PRI_PH
+			 *   Index 9 -> RP1_CLK_SLOW_SYS
+			 *   Index 10-> RP1_CLK_SDIO_TIMER
+			 *   Index 11-> RP1_CLK_SDIO_ALT_SRC
+			 *   Index 12-> RP1_CLK_ETH_TSU
+			 *
+			 * Only the two at index 2 (RP1_PLL_SYS) and index 7 (RP1_CLK_SYS)
+			 * are changed to 300000000.
 			 */
 			assigned-clock-rates = <
-				/* RP1_PLL_SYS_CORE  */ 1000000000
-				/* RP1_PLL_AUDIO_CORE*/ 1536000000
-				/* RP1_PLL_SYS       */ 300000000
-				/* RP1_PLL_SYS_SEC   */ 125000000
-				/* RP1_CLK_ETH       */ 125000000
-				/* RP1_PLL_AUDIO     */ 61440000
-				/* RP1_PLL_AUDIO_SEC */ 153600000
-				/* RP1_CLK_SYS       */ 300000000
-				/* RP1_PLL_SYS_PRI_PH*/ 100000000
-				/* RP1_CLK_SLOW_SYS  */ 50000000
-				/* RP1_CLK_SDIO_TIMER*/ 1000000
-				/* RP1_CLK_SDIO_ALT_SRC*/ 200000000
-				/* RP1_CLK_ETH_TSU   */ 50000000
+				/* RP1_PLL_SYS_CORE   */ 1000000000
+				/* RP1_PLL_AUDIO_CORE */ 1536000000
+				/* RP1_PLL_SYS        */ 300000000
+				/* RP1_PLL_SYS_SEC    */ 125000000
+				/* RP1_PLL_AUDIO      */ 61440000
+				/* RP1_PLL_AUDIO_SEC  */ 192000000
+				/* RP1_CLK_SYS        */ 300000000
+				/* RP1_PLL_SYS_PRI_PH */ 100000000
+				/* RP1_CLK_SLOW_SYS   */ 50000000
+				/* RP1_CLK_SDIO_TIMER */ 1000000
+				/* RP1_CLK_SDIO_ALT_SRC */ 200000000
+				/* RP1_CLK_ETH_TSU    */ 50000000
 			>;
 		};
 	};
