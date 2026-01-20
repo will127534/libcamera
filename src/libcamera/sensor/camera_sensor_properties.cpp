@@ -132,6 +132,11 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.hblankDelay = 2
 			},
 		} },
+		{ "gmax3412", {
+			.unitCellSize = { 3400, 3400 },
+                        .testPatternModes = {},
+                        .sensorDelays = {},
+		} },
 		{ "hi846", {
 			.unitCellSize = { 1120, 1120 },
 			.testPatternModes = {
