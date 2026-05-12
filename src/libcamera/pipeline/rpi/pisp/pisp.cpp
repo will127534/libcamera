@@ -46,6 +46,7 @@
 #include "../common/rpi_stream.h"
 
 #include "qbc_remosaic.h"
+#include "raw_stats.h"
 
 namespace libcamera {
 
@@ -68,6 +69,9 @@ constexpr unsigned int DefaultCompressionMode = 1;
  * Must match the driver-side definition (out-of-tree, IMX vendor block). */
 /* Backed by QbcRemosaic::kQbcCid — see qbc_remosaic.h. */
 constexpr uint32_t kQbcCid = QbcRemosaic::kQbcCid;
+
+/* Vendor V4L2 control on the IMX585 subdev — 1 if active mode is ClearHDR.
+ * Backed by RawStatsProducer::kClearHdrCid — see raw_stats.h. */
 
 const std::vector<std::pair<BayerFormat, unsigned int>> BayerToMbusCodeMap{
 	{ { BayerFormat::BGGR, 8, BayerFormat::Packing::None }, MEDIA_BUS_FMT_SBGGR8_1X8, },
@@ -849,7 +853,13 @@ private:
 	 * nullptr → sensor is in a non-QBC (binned NQ) mode and HW stats apply. */
 	std::unique_ptr<QbcRemosaic> qbc_;
 
+	/* SW stats producer for ClearHDR / high-bit-depth raw paths where the
+	 * HW BE stats are unreliable. Owned when the sensor advertises ClearHDR
+	 * via RawStatsProducer::kClearHdrCid. nullptr otherwise. */
+	std::unique_ptr<RawStatsProducer> rawStats_;
+
 	void processQbcFrame(FrameBuffer *raw, FrameBuffer *stats);
+	void processRawStats(FrameBuffer *raw, FrameBuffer *stats);
 
 	bool cfeJobComplete() const
 	{
@@ -1500,6 +1510,26 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		if (!v.isNone() && v.get<int32_t>() != 0)
 			qbc_ = std::make_unique<QbcRemosaic>();
 	}
+
+	/*
+	 * ClearHDR detection (imx585) — separate from QBC. ClearHDR raw is
+	 * already standard RGGB at 14/16-bit unpacked, but the HW BE stats
+	 * are unreliable past 12-bit. When the flag is set, run a SW stats
+	 * producer (no remosaic — only stats).
+	 */
+	rawStats_.reset();
+	if (sensor_->controls().find(RawStatsProducer::kClearHdrCid) != sensor_->controls().end()) {
+		static constexpr uint32_t kClearHdrCids[] = { RawStatsProducer::kClearHdrCid };
+		ControlList ctrls = sensor_->getControls(kClearHdrCids);
+		auto v = ctrls.get(RawStatsProducer::kClearHdrCid);
+		if (!v.isNone() && v.get<int32_t>() != 0) {
+			LOG(RPI, Info)
+				<< "ClearHDR SW stats producer enabled for "
+				<< sensor_->model();
+			rawStats_ = std::make_unique<RawStatsProducer>();
+			rawStats_->loadMeteringWeights(sensor_->model());
+		}
+	}
 	if (qbc_) {
 		LOG(RPI, Info) << "QBC remosaic enabled for " << sensor_->model();
 
@@ -1824,6 +1854,11 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 	    job.buffers.count(&cfe_[Cfe::Output0]) &&
 	    job.buffers.count(&cfe_[Cfe::Stats])) {
 		processQbcFrame(job.buffers[&cfe_[Cfe::Output0]],
+				job.buffers[&cfe_[Cfe::Stats]]);
+	} else if (rawStats_ &&
+		   job.buffers.count(&cfe_[Cfe::Output0]) &&
+		   job.buffers.count(&cfe_[Cfe::Stats])) {
+		processRawStats(job.buffers[&cfe_[Cfe::Output0]],
 				job.buffers[&cfe_[Cfe::Stats]]);
 	}
 
@@ -2362,13 +2397,15 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 }
 
 /*
- * Fan-out the IPA's per-frame metadata: AWB gains go to the SW QBC remosaic
- * so its histogram can weight by post-WB Y.
+ * Fan-out the IPA's per-frame metadata: AWB gains go to whichever SW stats
+ * path is active so the histogram weighting matches post-WB Y.
  */
 void PiSPCameraData::onMetadataReady(const ControlList &metadata)
 {
 	if (qbc_)
 		qbc_->updateWbGains(metadata);
+	if (rawStats_)
+		rawStats_->updateWbGains(metadata);
 }
 
 /*
@@ -2398,6 +2435,37 @@ void PiSPCameraData::processQbcFrame(FrameBuffer *raw, FrameBuffer *stats)
 	dmabufSyncStart(stats->planes()[0].fd);
 
 	qbc_->process(rawPx, st, width, height, stride);
+
+	dmabufSyncEnd(stats->planes()[0].fd);
+	dmabufSyncEnd(raw->planes()[0].fd);
+}
+
+/*
+ * Thin wrapper for the ClearHDR / high-bit-depth SW stats path. No remosaic —
+ * the raw buffer is already standard RGGB Bayer at higher bit depth. Only
+ * the stats are recomputed; the raw is left untouched for the BE to consume.
+ */
+void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
+{
+	RPi::Stream *rawStream = &cfe_[Cfe::Output0];
+	RPi::Stream *statsStream = &cfe_[Cfe::Stats];
+
+	const RPi::BufferObject &rawBuf = rawStream->getBuffer(rawStream->getBufferId(raw));
+	const RPi::BufferObject &statsBuf = statsStream->getBuffer(statsStream->getBufferId(stats));
+
+	const StreamConfiguration &cfg = rawStream->configuration();
+	unsigned int width = cfg.size.width;
+	unsigned int height = cfg.size.height;
+	unsigned int stride = cfg.stride;
+	ASSERT(stride >= width * 2u);
+
+	const uint16_t *rawPx = reinterpret_cast<const uint16_t *>(rawBuf.mapped->planes()[0].data());
+	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
+
+	dmabufSyncStart(raw->planes()[0].fd);
+	dmabufSyncStart(stats->planes()[0].fd);
+
+	rawStats_->process(rawPx, st, width, height, stride);
 
 	dmabufSyncEnd(stats->planes()[0].fd);
 	dmabufSyncEnd(raw->planes()[0].fd);
