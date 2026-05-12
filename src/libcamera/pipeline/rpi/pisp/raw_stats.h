@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
  * SW stats producer for the PiSP pipeline handler — sized for non-QBC raw
- * paths where the CFE hardware-stats path is unreliable (ClearHDR / 14-bit
- * / 16-bit unpacked). The data is already standard 2×2 RGGB Bayer; no
- * remosaic is needed. Reuses the same statistics layout the IPA expects
- * (pisp_statistics: AWB zones, AGC histogram, AGC Y_sum/counted), gated on
- * a per-sensor V4L2 control (e.g. V4L2_CID_USER_BASE + 0x10b9 on IMX585).
+ * paths where the CFE hardware-stats path is unreliable. The CFE has a known
+ * bug for 14-bit and 16-bit unpacked raw (libcamera-rpi already does a SW
+ * unpack/endian-swap on the data path; this class does the same for the
+ * stats path). Gated on the existing Needs14bitUnpack / Needs16bitEndianSwap
+ * stream flags — no sensor-specific control needed.
  *
- * Symmetric with QbcRemosaic — same control/AWB/metering interface, same
- * output stats layout — but without the QBC permutation step.
+ * The data is already standard 2×2 RGGB Bayer; no remosaic is needed. Reuses
+ * the same statistics layout the IPA expects (pisp_statistics: AWB zones,
+ * AGC histogram, AGC Y_sum/counted). Symmetric with QbcRemosaic — same
+ * AWB/metering interface, same output stats layout — without the QBC
+ * permutation step.
  */
 
 #pragma once
@@ -17,8 +20,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-
-#include <linux/v4l2-controls.h>
 
 #include <libpisp/frontend/pisp_statistics.h>
 
@@ -29,10 +30,6 @@ namespace libcamera {
 class RawStatsProducer
 {
 public:
-	/* ClearHDR / "HW stats unreliable" flag — currently published by the
-	 * IMX585 driver when V4L2_CID_WIDE_DYNAMIC_RANGE is on. */
-	static constexpr uint32_t kClearHdrCid = V4L2_CID_USER_BASE + 0x10b9;
-
 	RawStatsProducer();
 
 	void loadMeteringWeights(const std::string &sensorModel);

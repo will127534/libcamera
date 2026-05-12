@@ -1512,23 +1512,25 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	}
 
 	/*
-	 * ClearHDR detection (imx585) — separate from QBC. ClearHDR raw is
-	 * already standard RGGB at 14/16-bit unpacked, but the HW BE stats
-	 * are unreliable past 12-bit. When the flag is set, run a SW stats
-	 * producer (no remosaic — only stats).
+	 * High-bit-depth SW stats fallback. The CFE statistics engine has a
+	 * known bug at ≥14-bit unpacked raw — exactly the regime the warnings
+	 * above already complain about ("statistics will not be correct"). The
+	 * raw pixels themselves are still standard 2×2 RGGB Bayer (just at
+	 * higher bit-depth and possibly endian-swapped), so no remosaic is
+	 * needed; only the stats are reconstructed. Engages for any sensor
+	 * whose active mode delivers 14- or 16-bit data — covers IMX585
+	 * ClearHDR (16-bit), IMX294 14-bit modes, and anything similar from a
+	 * future sensor.
 	 */
 	rawStats_.reset();
-	if (sensor_->controls().find(RawStatsProducer::kClearHdrCid) != sensor_->controls().end()) {
-		static constexpr uint32_t kClearHdrCids[] = { RawStatsProducer::kClearHdrCid };
-		ControlList ctrls = sensor_->getControls(kClearHdrCids);
-		auto v = ctrls.get(RawStatsProducer::kClearHdrCid);
-		if (!v.isNone() && v.get<int32_t>() != 0) {
-			LOG(RPI, Info)
-				<< "ClearHDR SW stats producer enabled for "
-				<< sensor_->model();
-			rawStats_ = std::make_unique<RawStatsProducer>();
-			rawStats_->loadMeteringWeights(sensor_->model());
-		}
+	if (!qbc_ &&
+	    (cfe_[Cfe::Output0].getFlags() &
+	     (StreamFlag::Needs14bitUnpack | StreamFlag::Needs16bitEndianSwap))) {
+		LOG(RPI, Info)
+			<< "High-bit-depth SW stats producer enabled for "
+			<< sensor_->model() << " — CFE HW stats unreliable at this bit depth.";
+		rawStats_ = std::make_unique<RawStatsProducer>();
+		rawStats_->loadMeteringWeights(sensor_->model());
 	}
 	if (qbc_) {
 		LOG(RPI, Info) << "QBC remosaic enabled for " << sensor_->model();
