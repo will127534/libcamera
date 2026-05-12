@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * QBC (Quad-Bayer Coding) SW remosaic + stats producer for the PiSP pipeline
+ * handler. Sits between the CFE buffer dequeue and the IPA stats consumer:
+ *
+ *   CFE writes raw 4×4-macro QBC buffer
+ *        │
+ *        ▼
+ *   QbcRemosaic::process(rawBuffer, statsBuffer)
+ *     - permutes RRGG → RGGB Bayer in-place so the BE can demosaic
+ *     - computes pisp_statistics (AWB zones, AGC histogram, AGC Y_sum)
+ *       from the raw QBC values, applying the same per-region metering
+ *       weights HW NQ uses (loaded from the sensor tuning JSON)
+ *        │
+ *        ▼
+ *   BE consumes the remosaic'd buffer; IPA consumes the SW-produced stats.
+ *
+ * Everything is sensor-format-agnostic except for the 4×4 QBC layout and
+ * pisp's 32×32 AWB-zone / 15×15 metering grid. The class is owned 1:1 by
+ * a PiSPCameraData when its sensor advertises QBC mode (see kQbcCid).
+ */
+
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <linux/v4l2-controls.h>
+
+#include <libpisp/frontend/pisp_statistics.h>
+
+#include <libcamera/controls.h>
+
+namespace libcamera {
+
+class QbcRemosaic
+{
+public:
+	/*
+	 * Vendor V4L2 control on the IMX294/IMX492 subdev advertising whether
+	 * the current sensor mode emits a 4×4 QBC macro CFA. Read-only volatile.
+	 * UAPI allocation pending — sits in the IMX user-CID block.
+	 */
+	static constexpr uint32_t kQbcCid = V4L2_CID_USER_BASE + 0x10b8;
+
+	QbcRemosaic();
+
+	/*
+	 * Read the centre-weighted AGC metering grid out of
+	 * /usr/local/share/libcamera/ipa/rpi/pisp/<sensorModel>.json so the SW
+	 * histogram can weight per-region counts the way HW NQ does (RPi
+	 * tuning guide §5.9.4: Pi 5 counts each pixel w_i times). Called at
+	 * pipeline configure time, after QBC mode is detected.
+	 */
+	void loadMeteringWeights(const std::string &sensorModel);
+
+	/* Slot for the IPA's metadataReady signal — captures ColourGains. */
+	void updateWbGains(const ControlList &metadata);
+
+	/*
+	 * In-place 4×4 QBC → 2×2 RGGB Bayer remosaic with per-pixel histogram
+	 * + AWB-zone stats production. width/height/stride are the CFE output
+	 * format in u16 units (stride is bytes). rawPx must be u16 left-
+	 * justified 12-bit data (max value 65520); st is the IPA's stats
+	 * buffer that this routine fully overwrites.
+	 */
+	void process(uint16_t *rawPx, pisp_statistics *st,
+		     unsigned int width, unsigned int height,
+		     unsigned int strideBytes);
+
+	/* Path of the last stats dump file written (for diagnostics). */
+	const std::string &lastDumpFile() const { return lastDumpFile_; }
+	void setLastDumpFile(std::string s) { lastDumpFile_ = std::move(s); }
+
+private:
+	/* AWB gains plumbed from the IPA, one frame behind. */
+	std::atomic<float> wbGainR_{ 1.0f };
+	std::atomic<float> wbGainG_{ 1.0f };
+	std::atomic<float> wbGainB_{ 1.0f };
+
+	/* macro-pair → AWB-cell-X LUT, built lazily on first frame. */
+	std::vector<uint16_t> pairCellX_;
+
+	/* AGC metering grid loaded from tuning JSON, then resolved per macro. */
+	std::vector<uint16_t> meteringWeights_;   /* row-major NxN grid */
+	unsigned int meteringGridW_ = 0;
+	unsigned int meteringGridH_ = 0;
+	std::vector<uint8_t> macroWeight_;        /* per-macro weight, sized to frame */
+
+	std::string lastDumpFile_;
+};
+
+} /* namespace libcamera */

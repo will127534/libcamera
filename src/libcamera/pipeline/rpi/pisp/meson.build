@@ -2,6 +2,7 @@
 
 libcamera_internal_sources += files([
     'pisp.cpp',
+    'qbc_remosaic.cpp',
 ])
 
 librt = cc.find_library('rt', required : true)

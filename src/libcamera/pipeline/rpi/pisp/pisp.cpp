@@ -6,6 +6,10 @@
  */
 
 #include <algorithm>
+#include <arm_neon.h>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -22,8 +26,11 @@
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
 
+#include <libcamera/base/file.h>
 #include <libcamera/base/shared_fd.h>
 #include <libcamera/formats.h>
+
+#include "libcamera/internal/yaml_parser.h"
 
 #include "libcamera/internal/device_enumerator.h"
 #include "libcamera/internal/shared_mem_object.h"
@@ -37,6 +44,8 @@
 
 #include "../common/pipeline_base.h"
 #include "../common/rpi_stream.h"
+
+#include "qbc_remosaic.h"
 
 namespace libcamera {
 
@@ -54,6 +63,11 @@ enum class Isp : unsigned int { Input, Output0, Output1, TdnInput, TdnOutput,
 /* Offset for all compressed buffers; mode for TDN and Stitch. */
 constexpr unsigned int DefaultCompressionOffset = 2048;
 constexpr unsigned int DefaultCompressionMode = 1;
+
+/* Vendor V4L2 control on the sensor subdev — 1 if active mode is Quad Bayer.
+ * Must match the driver-side definition (out-of-tree, IMX vendor block). */
+/* Backed by QbcRemosaic::kQbcCid — see qbc_remosaic.h. */
+constexpr uint32_t kQbcCid = QbcRemosaic::kQbcCid;
 
 const std::vector<std::pair<BayerFormat, unsigned int>> BayerToMbusCodeMap{
 	{ { BayerFormat::BGGR, 8, BayerFormat::Packing::None }, MEDIA_BUS_FMT_SBGGR8_1X8, },
@@ -756,6 +770,7 @@ public:
 	void processStatsComplete(const ipa::RPi::BufferIds &buffers);
 	void prepareIspComplete(const ipa::RPi::BufferIds &buffers, bool stitchSwapBuffers);
 	void setCameraTimeout(uint32_t maxFrameLengthMs);
+	void onMetadataReady(const ControlList &metadata);
 
 	/* Array of CFE and ISP device streams and associated buffers/streams. */
 	RPi::Device<Cfe, 4> cfe_;
@@ -828,6 +843,13 @@ private:
 	};
 
 	std::queue<CfeJob> cfeJobQueue_;
+
+	/* SW QBC remosaic + stats producer, owned when the sensor advertises
+	 * a 4×4 Quad-Bayer mode via the V4L2 QbcRemosaic::kQbcCid control.
+	 * nullptr → sensor is in a non-QBC (binned NQ) mode and HW stats apply. */
+	std::unique_ptr<QbcRemosaic> qbc_;
+
+	void processQbcFrame(FrameBuffer *raw, FrameBuffer *stats);
 
 	bool cfeJobComplete() const
 	{
@@ -1088,7 +1110,7 @@ int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &came
 	/* Locate and open the cfe video streams. */
 	data->cfe_[Cfe::Output0] = RPi::Stream("CFE Image", cfeImage, StreamFlag::RequiresMmap);
 	data->cfe_[Cfe::Embedded] = RPi::Stream("CFE Embedded", cfeEmbedded);
-	data->cfe_[Cfe::Stats] = RPi::Stream("CFE Stats", cfeStats);
+	data->cfe_[Cfe::Stats] = RPi::Stream("CFE Stats", cfeStats, StreamFlag::RequiresMmap);
 	data->cfe_[Cfe::Config] = RPi::Stream("CFE Config", cfeConfig,
 					      StreamFlag::Recurrent | StreamFlag::RequiresMmap);
 
@@ -1161,6 +1183,7 @@ int PipelineHandlerPiSP::platformRegister(std::unique_ptr<RPi::CameraData> &came
 	data->ipa_->prepareIspComplete.connect(data, &PiSPCameraData::prepareIspComplete);
 	data->ipa_->processStatsComplete.connect(data, &PiSPCameraData::processStatsComplete);
 	data->ipa_->setCameraTimeout.connect(data, &PiSPCameraData::setCameraTimeout);
+	data->ipa_->metadataReady.connect(data, &PiSPCameraData::onMetadataReady);
 
 	/*
 	 * List the available streams an application may request. At present, we
@@ -1468,9 +1491,46 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			<< "  will not be correct. You must use manual camera settings.";
 	}
 
+	/* Quad-Bayer detection — vendor V4L2 control on the sensor subdev. */
+	qbc_.reset();
+	if (sensor_->controls().find(QbcRemosaic::kQbcCid) != sensor_->controls().end()) {
+		static constexpr uint32_t kQbcCids[] = { QbcRemosaic::kQbcCid };
+		ControlList ctrls = sensor_->getControls(kQbcCids);
+		auto v = ctrls.get(QbcRemosaic::kQbcCid);
+		if (!v.isNone() && v.get<int32_t>() != 0)
+			qbc_ = std::make_unique<QbcRemosaic>();
+	}
+	if (qbc_) {
+		LOG(RPI, Info) << "QBC remosaic enabled for " << sensor_->model();
+
+		/*
+		 * The QBC remosaic kernel does in-place 16-bit unpacked NEON
+		 * processing, so the CFE must deliver unpacked 16-bit. Override
+		 * any packed/compressed format the user (or auto-pick) chose.
+		 */
+		V4L2SubdeviceFormat sensorFormatMod = rpiConfig->sensorFormat_;
+		sensorFormatMod.code = mbusCodeUnpacked16(sensorFormatMod.code);
+		cfeFormat = RPi::PipelineHandlerBase::toV4L2DeviceFormat(
+			cfe, sensorFormatMod, BayerFormat::Packing::None);
+		computeOptimalStride(cfeFormat);
+
+		qbc_->loadMeteringWeights(sensor_->model());
+	}
+
 	ret = cfe->setFormat(&cfeFormat);
 	if (ret)
 		return ret;
+
+	if (qbc_ && !rawStreams.empty()) {
+		/*
+		 * Sync the external raw-stream config to the actual CFE format.
+		 * After setFormat the kernel has filled planes[0].size; rpicam-apps
+		 * reads cfg.frameSize to allocate the dma-heap buffer.
+		 */
+		rawStreams[0].cfg->pixelFormat = cfeFormat.fourcc.toPixelFormat();
+		rawStreams[0].cfg->stride = cfeFormat.planes[0].bpl;
+		rawStreams[0].cfg->frameSize = cfeFormat.planes[0].size;
+	}
 
 	/* Set the TDN and Stitch node formats in case they are turned on. */
 	isp_[Isp::TdnOutput].dev()->setFormat(&cfeFormat);
@@ -1758,6 +1818,13 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 		/* The config buffer can be re-queued back straight away. */
 		handleStreamBuffer(buffer, &cfe_[Cfe::Config]);
 		prepareCfe();
+	}
+
+	if (qbc_ &&
+	    job.buffers.count(&cfe_[Cfe::Output0]) &&
+	    job.buffers.count(&cfe_[Cfe::Stats])) {
+		processQbcFrame(job.buffers[&cfe_[Cfe::Output0]],
+				job.buffers[&cfe_[Cfe::Stats]]);
 	}
 
 	handleState();
@@ -2294,6 +2361,48 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 	isp_[Isp::Config].queueBuffer(config.buffer);
 }
 
+/*
+ * Fan-out the IPA's per-frame metadata: AWB gains go to the SW QBC remosaic
+ * so its histogram can weight by post-WB Y.
+ */
+void PiSPCameraData::onMetadataReady(const ControlList &metadata)
+{
+	if (qbc_)
+		qbc_->updateWbGains(metadata);
+}
+
+/*
+ * Thin wrapper around the SW QBC kernel — pulls the mapped pointers out of
+ * the CFE buffers and hands them to QbcRemosaic. dmabuf-sync brackets the
+ * in-place remosaic so the buffer is coherent for the BE that consumes it
+ * next.
+ */
+void PiSPCameraData::processQbcFrame(FrameBuffer *raw, FrameBuffer *stats)
+{
+	RPi::Stream *rawStream = &cfe_[Cfe::Output0];
+	RPi::Stream *statsStream = &cfe_[Cfe::Stats];
+
+	const RPi::BufferObject &rawBuf = rawStream->getBuffer(rawStream->getBufferId(raw));
+	const RPi::BufferObject &statsBuf = statsStream->getBuffer(statsStream->getBufferId(stats));
+
+	const StreamConfiguration &cfg = rawStream->configuration();
+	unsigned int width = cfg.size.width;
+	unsigned int height = cfg.size.height;
+	unsigned int stride = cfg.stride;
+	ASSERT(stride >= width * 2u);
+
+	uint16_t *rawPx = reinterpret_cast<uint16_t *>(rawBuf.mapped->planes()[0].data());
+	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
+
+	dmabufSyncStart(raw->planes()[0].fd);
+	dmabufSyncStart(stats->planes()[0].fd);
+
+	qbc_->process(rawPx, st, width, height, stride);
+
+	dmabufSyncEnd(stats->planes()[0].fd);
+	dmabufSyncEnd(raw->planes()[0].fd);
+}
+
 void PiSPCameraData::tryRunPipeline()
 {
 	/* If any of our request or buffer queues are empty, we cannot proceed. */
@@ -2317,6 +2426,31 @@ void PiSPCameraData::tryRunPipeline()
 	unsigned int bayerId = cfe_[Cfe::Output0].getBufferId(job.buffers[&cfe_[Cfe::Output0]]);
 	unsigned int statsId = cfe_[Cfe::Stats].getBufferId(job.buffers[&cfe_[Cfe::Stats]]);
 	ASSERT(bayerId && statsId);
+
+	/*
+	 * Optional stats dump for debugging the SW vs HW AE/AWB divergence.
+	 * Set QBC_STATS_DUMP_PREFIX=/tmp/foo to write the pisp_statistics buffer
+	 * (final, what the IPA is about to read) of every frame as a binary file
+	 * /tmp/foo_NNNN.bin where NNNN is the frame sequence number. Pair with
+	 * the small parse script in utils/.
+	 */
+	if (const char *dumpPrefix = utils::secure_getenv("QBC_STATS_DUMP_PREFIX")) {
+		const RPi::BufferObject &sBuf =
+			cfe_[Cfe::Stats].getBuffer(statsId);
+		if (sBuf.mapped) {
+			char fn[256];
+			snprintf(fn, sizeof(fn), "%s_%04u.bin", dumpPrefix,
+				 static_cast<unsigned>(request->sequence()));
+			FILE *f = fopen(fn, "wb");
+			if (f) {
+				fwrite(sBuf.mapped->planes()[0].data(), 1,
+				       sizeof(pisp_statistics), f);
+				fclose(f);
+				LOG(RPI, Info) << "Stats dump → " << fn
+					<< " (qbc=" << (qbc_ ? "1" : "0") << ")";
+			}
+		}
+	}
 
 	std::stringstream ss;
 	ss << "Signalling IPA processStats and prepareIsp:"
