@@ -59,66 +59,134 @@ QbcRemosaic::QbcRemosaic()
 {
 }
 
+namespace {
+
+/*
+ * Pull weights[] for `modeName` from the tuning JSON. Supports both the
+ * imx294-style flat rpi.agc.metering_modes layout and the imx585-style
+ * channels[0].metering_modes (multi-channel AGC for HDR). See the
+ * RawStatsProducer version for the full discussion.
+ */
+std::vector<uint16_t> loadQbcMeteringWeightsForMode(const std::string &sensorModel,
+						    const std::string &modeName,
+						    std::string *firstName = nullptr)
+{
+	std::vector<uint16_t> out;
+	const std::string tuningPath =
+		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
+	File f(tuningPath);
+	if (!f.open(File::OpenModeFlag::ReadOnly))
+		return out;
+	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
+	if (!root)
+		return out;
+
+	auto pickFromModes = [&](const YamlObject &modes) -> const YamlObject * {
+		const YamlObject *pick = nullptr;
+		for (const auto &[name, node] : modes.asDict()) {
+			if (firstName && firstName->empty())
+				*firstName = name;
+			if (name == modeName) {
+				pick = &node;
+				break;
+			}
+		}
+		return pick;
+	};
+
+	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
+		const YamlObject &agc = entry["rpi.agc"];
+		if (!agc.isDictionary())
+			continue;
+
+		const YamlObject *modes = nullptr;
+		const YamlObject &flat = agc["metering_modes"];
+		if (flat.isDictionary())
+			modes = &flat;
+		else if (agc["channels"].isList() && agc["channels"].size() > 0) {
+			const YamlObject &ch0 = agc["channels"][std::size_t(0)];
+			const YamlObject &chmm = ch0["metering_modes"];
+			if (chmm.isDictionary())
+				modes = &chmm;
+		}
+		if (!modes)
+			continue;
+
+		const YamlObject *pick = pickFromModes(*modes);
+		if (!pick)
+			break;
+		const YamlObject &weights = (*pick)["weights"];
+		out.reserve(weights.size());
+		for (const YamlObject &w : weights.asList())
+			out.push_back(w.get<uint16_t>().value_or(1));
+		break;
+	}
+	return out;
+}
+
+} /* anonymous namespace */
+
 void QbcRemosaic::loadMeteringWeights(const std::string &sensorModel)
 {
+	std::lock_guard<std::mutex> lk(meteringMutex_);
+
+	sensorModel_ = sensorModel;
 	meteringWeights_.clear();
 	macroWeight_.clear();
 	meteringGridW_ = meteringGridH_ = 0;
 
-	const std::string tuningPath =
-		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
-	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly)) {
-		LOG(RPI, Warning) << "QBC: cannot open tuning " << tuningPath
-				  << " — falling back to uniform metering";
+	std::string first;
+	(void)loadQbcMeteringWeightsForMode(sensorModel, "", &first);
+	if (first.empty()) {
+		LOG(RPI, Warning) << "QBC: no metering modes in tuning for "
+				  << sensorModel << " — uniform metering";
 		return;
 	}
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
-	if (!root) {
-		LOG(RPI, Warning) << "QBC: failed to parse " << tuningPath;
+	auto weights = loadQbcMeteringWeightsForMode(sensorModel, first);
+	if (weights.empty()) {
+		LOG(RPI, Warning) << "QBC: empty weights for '" << first
+				  << "' in " << sensorModel << " tuning — uniform";
 		return;
 	}
-
-	const YamlObject &algos = (*root)["algorithms"];
-	for (const YamlObject &entry : algos.asList()) {
-		const YamlObject &agc = entry["rpi.agc"];
-		if (!agc.isDictionary())
-			continue;
-		const YamlObject &modes = agc["metering_modes"];
-		if (!modes.isDictionary())
-			continue;
-		const YamlObject *pick = nullptr;
-		for (const auto &[name, node] : modes.asDict()) {
-			if (name == "centre-weighted") { pick = &node; break; }
-			if (!pick) pick = &node;
-		}
-		if (!pick)
-			continue;
-		const YamlObject &weights = (*pick)["weights"];
-		if (!weights.size())
-			continue;
-		meteringWeights_.reserve(weights.size());
-		for (const YamlObject &w : weights.asList())
-			meteringWeights_.push_back(
-				w.get<uint16_t>().value_or(1));
-		break;
-	}
-	if (meteringWeights_.empty()) {
-		LOG(RPI, Warning) << "QBC: no metering weights in tuning — uniform";
-		return;
-	}
-
-	unsigned int n = meteringWeights_.size();
+	unsigned int n = weights.size();
 	unsigned int side = static_cast<unsigned int>(std::sqrt(n));
 	if (side * side != n) {
 		LOG(RPI, Warning) << "QBC: non-square metering grid (" << n
-				  << ") — ignoring weights";
-		meteringWeights_.clear();
+				  << ") — uniform";
 		return;
 	}
+	meteringWeights_ = std::move(weights);
 	meteringGridW_ = meteringGridH_ = side;
+	meteringModeName_ = first;
 	LOG(RPI, Info) << "QBC: loaded " << side << "×" << side
-		       << " AGC metering grid from " << tuningPath;
+		       << " '" << first << "' metering grid for " << sensorModel;
+}
+
+void QbcRemosaic::setMeteringMode(const std::string &modeName)
+{
+	std::lock_guard<std::mutex> lk(meteringMutex_);
+	if (modeName == meteringModeName_ || sensorModel_.empty())
+		return;
+	auto weights = loadQbcMeteringWeightsForMode(sensorModel_, modeName);
+	if (weights.empty()) {
+		LOG(RPI, Warning) << "QBC: metering mode '" << modeName
+				  << "' not in " << sensorModel_
+				  << " tuning — keeping '" << meteringModeName_ << "'";
+		return;
+	}
+	unsigned int n = weights.size();
+	unsigned int side = static_cast<unsigned int>(std::sqrt(n));
+	if (side * side != n) {
+		LOG(RPI, Warning) << "QBC: non-square metering grid for '"
+				  << modeName << "' (" << n << ") — keeping current";
+		return;
+	}
+	LOG(RPI, Info) << "QBC: metering mode '" << meteringModeName_
+		       << "' → '" << modeName << "'";
+	meteringWeights_ = std::move(weights);
+	meteringGridW_ = meteringGridH_ = side;
+	meteringModeName_ = modeName;
+	macroWeight_.clear();  /* invalidate cache; rebuild on next process() */
 }
 
 uint16_t QbcRemosaic::loadBlackLevel(const std::string &sensorModel)
@@ -262,8 +330,14 @@ void QbcRemosaic::process(uint16_t *rawPx, pisp_statistics *st,
 
 	/*
 	 * Per-macro metering weight LUT — each 4×4 macro maps to one cell in
-	 * the IPA's metering grid (15×15 for pisp). Built once per resolution.
+	 * the IPA's metering grid (15×15 for pisp). Built once per resolution,
+	 * also rebuilt when setMeteringMode() invalidates macroWeight_.
+	 * meteringMutex_ serialises the (rare) rebuild against
+	 * setMeteringMode(); the inner per-macro loop later reads macroWeight_
+	 * lock-free because nothing modifies it while we still hold the lock.
 	 */
+	{
+	std::lock_guard<std::mutex> lk(meteringMutex_);
 	if (macroWeight_.size() != macroRows * macroCols &&
 	    meteringGridW_ > 0 && meteringGridH_ > 0) {
 		macroWeight_.resize(macroRows * macroCols);
@@ -278,6 +352,7 @@ void QbcRemosaic::process(uint16_t *rawPx, pisp_statistics *st,
 			}
 		}
 	}
+	} /* meteringMutex_ scope */
 
 	/*
 	 * Post-WB BT.601 Y coefficients baked into Q10, matching HW NQ's

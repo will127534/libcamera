@@ -33,56 +33,146 @@ RawStatsProducer::RawStatsProducer()
 {
 }
 
-void RawStatsProducer::loadMeteringWeights(const std::string &sensorModel)
-{
-	meteringWeights_.clear();
-	cellWeight_.clear();
-	meteringGridW_ = meteringGridH_ = 0;
+namespace {
 
+/*
+ * Pull the weights[] grid for `modeName` out of the rpi.agc metering_modes
+ * dict at /usr/local/share/libcamera/ipa/rpi/pisp/<sensorModel>.json.
+ *
+ * Two tuning structures are supported (matches what the AGC IPA accepts):
+ *   1. Flat:        rpi.agc.metering_modes.<name>.weights  (imx294-style)
+ *   2. Multi-chan:  rpi.agc.channels[].metering_modes.<name>.weights
+ *                                                          (imx585 HDR-style)
+ * For (2) we read from channel 0 — that's the primary AGC channel the IPA
+ * runs on for the SW-stats path (HDR channel selection happens above and
+ * doesn't affect the SW kernel's weight lookup).
+ *
+ * Empty result if anything fails. `firstName`, if non-null, is set to the
+ * first-listed mode found (matches the IPA's defaultMeteringMode).
+ */
+std::vector<uint16_t> loadMeteringWeightsForMode(const std::string &sensorModel,
+						 const std::string &modeName,
+						 std::string *firstName = nullptr)
+{
+	std::vector<uint16_t> out;
 	const std::string tuningPath =
 		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
 	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly)) {
-		LOG(RPI, Warning) << "RawStats: cannot open " << tuningPath
-				  << " — uniform metering";
-		return;
-	}
+	if (!f.open(File::OpenModeFlag::ReadOnly))
+		return out;
 	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
 	if (!root)
-		return;
+		return out;
 
-	const YamlObject &algos = (*root)["algorithms"];
-	for (const YamlObject &entry : algos.asList()) {
+	auto pickFromModes = [&](const YamlObject &modes) -> const YamlObject * {
+		const YamlObject *pick = nullptr;
+		for (const auto &[name, node] : modes.asDict()) {
+			if (firstName && firstName->empty())
+				*firstName = name;
+			if (name == modeName) {
+				pick = &node;
+				break;
+			}
+		}
+		return pick;
+	};
+
+	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
 		const YamlObject &agc = entry["rpi.agc"];
 		if (!agc.isDictionary())
 			continue;
-		const YamlObject &modes = agc["metering_modes"];
-		if (!modes.isDictionary())
-			continue;
-		const YamlObject *pick = nullptr;
-		for (const auto &[name, node] : modes.asDict()) {
-			if (name == "centre-weighted") { pick = &node; break; }
-			if (!pick) pick = &node;
+
+		/* Flat (imx294) or multi-channel (imx585) layout. */
+		const YamlObject *modes = nullptr;
+		const YamlObject &flat = agc["metering_modes"];
+		if (flat.isDictionary())
+			modes = &flat;
+		else if (agc["channels"].isList() && agc["channels"].size() > 0) {
+			const YamlObject &ch0 = agc["channels"][std::size_t(0)];
+			const YamlObject &chmm = ch0["metering_modes"];
+			if (chmm.isDictionary())
+				modes = &chmm;
 		}
-		if (!pick)
+		if (!modes)
 			continue;
+
+		const YamlObject *pick = pickFromModes(*modes);
+		if (!pick)
+			break;
 		const YamlObject &weights = (*pick)["weights"];
-		meteringWeights_.reserve(weights.size());
+		out.reserve(weights.size());
 		for (const YamlObject &w : weights.asList())
-			meteringWeights_.push_back(
-				w.get<uint16_t>().value_or(1));
+			out.push_back(w.get<uint16_t>().value_or(1));
 		break;
 	}
-	if (meteringWeights_.empty())
-		return;
+	return out;
+}
 
-	unsigned int n = meteringWeights_.size();
-	unsigned int side = static_cast<unsigned int>(std::sqrt(n));
-	if (side * side != n) {
-		meteringWeights_.clear();
+} /* anonymous namespace */
+
+void RawStatsProducer::loadMeteringWeights(const std::string &sensorModel)
+{
+	std::lock_guard<std::mutex> lk(meteringMutex_);
+
+	sensorModel_ = sensorModel;
+	cellWeight_.clear();
+	meteringGridW_ = meteringGridH_ = 0;
+	meteringWeights_.clear();
+
+	/* Look up the first-listed mode (= IPA's defaultMeteringMode). */
+	std::string first;
+	auto weights = loadMeteringWeightsForMode(sensorModel, "", &first);
+	if (first.empty()) {
+		LOG(RPI, Warning) << "RawStats: no metering modes in tuning for "
+				  << sensorModel << " — uniform metering";
 		return;
 	}
+	/* Now actually fetch its weights. */
+	weights = loadMeteringWeightsForMode(sensorModel, first);
+	if (weights.empty()) {
+		LOG(RPI, Warning) << "RawStats: empty weights for " << first
+				  << " in " << sensorModel << " tuning — uniform";
+		return;
+	}
+	unsigned int n = weights.size();
+	unsigned int side = static_cast<unsigned int>(std::sqrt(n));
+	if (side * side != n) {
+		LOG(RPI, Warning) << "RawStats: non-square metering grid (" << n
+				  << ") — uniform";
+		return;
+	}
+	meteringWeights_ = std::move(weights);
 	meteringGridW_ = meteringGridH_ = side;
+	meteringModeName_ = first;
+	LOG(RPI, Info) << "RawStats: loaded " << side << "×" << side
+		       << " '" << first << "' metering grid for " << sensorModel;
+}
+
+void RawStatsProducer::setMeteringMode(const std::string &modeName)
+{
+	std::lock_guard<std::mutex> lk(meteringMutex_);
+	if (modeName == meteringModeName_ || sensorModel_.empty())
+		return;
+	auto weights = loadMeteringWeightsForMode(sensorModel_, modeName);
+	if (weights.empty()) {
+		LOG(RPI, Warning) << "RawStats: metering mode '" << modeName
+				  << "' not in " << sensorModel_
+				  << " tuning — keeping '" << meteringModeName_ << "'";
+		return;
+	}
+	unsigned int n = weights.size();
+	unsigned int side = static_cast<unsigned int>(std::sqrt(n));
+	if (side * side != n) {
+		LOG(RPI, Warning) << "RawStats: non-square metering grid for '"
+				  << modeName << "' (" << n << ") — keeping current";
+		return;
+	}
+	LOG(RPI, Info) << "RawStats: metering mode '" << meteringModeName_
+		       << "' → '" << modeName << "'";
+	meteringWeights_ = std::move(weights);
+	meteringGridW_ = meteringGridH_ = side;
+	meteringModeName_ = modeName;
+	cellWeight_.clear();  /* force re-cache next process() */
 }
 
 uint16_t RawStatsProducer::loadBlackLevel(const std::string &sensorModel)
@@ -139,6 +229,16 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 	const unsigned int cellCols = width / 2;
 	const unsigned int cellPairs = cellCols / 4; /* NEON 8 source cols = 4 RGGB pairs */
 
+	/*
+	 * Briefly snapshot the metering state under meteringMutex_ — if a
+	 * setMeteringMode() call has just come in from the IPA, this is where
+	 * we pick up the new weights / cellWeight invalidation. We hold the
+	 * lock only for the cellWeight_ rebuild; the inner loop reads
+	 * cellWeight_ without locking because the build is complete by then
+	 * and setMeteringMode() won't modify it while we still own the lock.
+	 */
+	{
+	std::lock_guard<std::mutex> lk(meteringMutex_);
 	if (cellWeight_.size() != cellRows * cellCols &&
 	    meteringGridW_ > 0 && meteringGridH_ > 0) {
 		cellWeight_.resize(cellRows * cellCols);
@@ -153,6 +253,7 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			}
 		}
 	}
+	} /* meteringMutex_ scope */
 
 	uint64_t totalY = 0;
 	auto t0 = std::chrono::steady_clock::now();

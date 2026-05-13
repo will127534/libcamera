@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -32,7 +33,21 @@ class RawStatsProducer
 public:
 	RawStatsProducer();
 
+	/*
+	 * Initial weight load. Picks the tuning JSON's first-listed metering
+	 * mode (matching the AGC IPA's defaultMeteringMode behaviour). After
+	 * this, setMeteringMode() can swap to a different mode at runtime
+	 * when the IPA reports a controls::AeMeteringMode change.
+	 */
 	void loadMeteringWeights(const std::string &sensorModel);
+
+	/*
+	 * Switch metering-mode weight grid. Pipeline handler should call this
+	 * from onMetadataReady when controls::AeMeteringMode changes, so the
+	 * SW kernel's AGC weights track the IPA's chosen mode. No-op if the
+	 * mode is already active.
+	 */
+	void setMeteringMode(const std::string &modeName);
 
 	/*
 	 * Read the IPA tuning's rpi.black_level.black_level entry (16-bit-shifted
@@ -72,10 +87,21 @@ private:
 	std::atomic<uint16_t> blackLevel_{ 3200 }; /* 16-bit-shifted; live-adjustable */
 
 	std::vector<uint16_t> pairCellX_;          /* RGGB-cell-pair → AWB-cell-X */
-	std::vector<uint16_t> meteringWeights_;    /* NxN row-major */
+
+	/*
+	 * Metering-mode state. meteringMutex_ serialises the (rare) reload
+	 * triggered by setMeteringMode() against the per-frame reader in
+	 * process(). Reading process() takes the mutex briefly at the top to
+	 * snapshot the current grid + cell map; the inner loop then uses the
+	 * snapshot lock-free.
+	 */
+	std::mutex meteringMutex_;
+	std::string sensorModel_;                  /* remembered for re-loads */
+	std::string meteringModeName_;             /* currently active mode */
+	std::vector<uint16_t> meteringWeights_;    /* NxN row-major weight grid */
 	unsigned int meteringGridW_ = 0;
 	unsigned int meteringGridH_ = 0;
-	std::vector<uint8_t> cellWeight_;          /* per-RGGB-cell weight */
+	std::vector<uint8_t> cellWeight_;          /* per-RGGB-cell weight cache */
 };
 
 } /* namespace libcamera */

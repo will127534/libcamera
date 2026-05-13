@@ -817,6 +817,16 @@ public:
 
 	bool adjustDeviceFormat(V4L2DeviceFormat &format) const;
 
+	/*
+	 * Forward an incoming controls::AeMeteringMode change to the active SW
+	 * stats kernel so its weight grid matches the IPA's chosen mode.
+	 * Public so PipelineHandlerPiSP::start() can call it before forwarding
+	 * the startup ControlList to IpaBase::start (the IPA clears its outgoing
+	 * libcameraMetadata_ before any frame is emitted, so the metadataReady
+	 * signal alone can't carry startup metering choices).
+	 */
+	void applyMeteringModeToSwStats(const ControlList &controls);
+
 private:
 	int platformConfigure(const RPi::RPiCameraConfiguration *rpiConfig) override;
 
@@ -915,6 +925,16 @@ private:
 	int platformRegister(std::unique_ptr<RPi::CameraData> &cameraData,
 			     std::shared_ptr<MediaDevice> cfe,
 			     std::shared_ptr<MediaDevice> isp) override;
+
+	/*
+	 * Override start() so we can catch the application's startup
+	 * ControlList — rpicam-vid's --metering flag arrives only here (it's
+	 * applied as a Camera::start(controls) argument, never as a per-
+	 * request control), and IpaBase::start() clears libcameraMetadata_
+	 * before any frame is emitted, so the SW-stats kernels can't pick
+	 * up the metering choice via the metadataReady signal alone.
+	 */
+	int start(Camera *camera, const ControlList *controls) override;
 };
 
 bool PipelineHandlerPiSP::match(DeviceEnumerator *enumerator)
@@ -1003,6 +1023,15 @@ bool PipelineHandlerPiSP::match(DeviceEnumerator *enumerator)
 	}
 
 	return false;
+}
+
+int PipelineHandlerPiSP::start(Camera *camera, const ControlList *controls)
+{
+	if (controls) {
+		PiSPCameraData *data = cameraData(camera);
+		data->applyMeteringModeToSwStats(*controls);
+	}
+	return RPi::PipelineHandlerBase::start(camera, controls);
 }
 
 int PipelineHandlerPiSP::allocateBuffers(Camera *camera)
@@ -2417,8 +2446,28 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 }
 
 /*
- * Fan-out the IPA's per-frame metadata: AWB gains go to whichever SW stats
- * path is active so the histogram weighting matches post-WB Y.
+ * Map a libcamera::controls::AeMeteringMode enum value to the metering
+ * mode key in the sensor tuning JSON (rpi.agc.metering_modes.<key>). Same
+ * mapping the IPA uses to translate the user's control into a tuning
+ * dictionary lookup; mirrored here so the SW QBC / RawStats kernels pick
+ * up the same weight grid HW NQ does.
+ */
+static const std::map<int32_t, std::string> kMeteringModeNameTable = {
+	{ controls::MeteringCentreWeighted, "centre-weighted" },
+	{ controls::MeteringSpot,           "spot" },
+	{ controls::MeteringMatrix,         "matrix" },
+	{ controls::MeteringCustom,         "custom" },
+};
+
+/*
+ * Fan-out the IPA's per-frame metadata to whichever SW stats path is
+ * active: AWB gains (so the SW Y histogram matches post-WB HW NQ Y), plus
+ * AeMeteringMode (so the SW weight grid tracks the user's selection — the
+ * IPA only emits this in metadata for the *frame on which it processed
+ * the control*, including startup-time --metering settings forwarded
+ * through IpaBase::start → applyControls. Per-request mid-stream changes
+ * are caught earlier via applyMeteringModeToSwStats() in tryRunPipeline,
+ * so this is a backstop for the startup case).
  */
 void PiSPCameraData::onMetadataReady(const ControlList &metadata)
 {
@@ -2426,6 +2475,23 @@ void PiSPCameraData::onMetadataReady(const ControlList &metadata)
 		qbc_->updateWbGains(metadata);
 	if (rawStats_)
 		rawStats_->updateWbGains(metadata);
+	applyMeteringModeToSwStats(metadata);
+}
+
+void PiSPCameraData::applyMeteringModeToSwStats(const ControlList &controls)
+{
+	if (!qbc_ && !rawStats_)
+		return;
+	const auto &mm = controls.get(controls::AeMeteringMode);
+	if (!mm)
+		return;
+	auto it = kMeteringModeNameTable.find(*mm);
+	if (it == kMeteringModeNameTable.end())
+		return;
+	if (qbc_)
+		qbc_->setMeteringMode(it->second);
+	if (rawStats_)
+		rawStats_->setMeteringMode(it->second);
 }
 
 /*
@@ -2607,6 +2673,14 @@ void PiSPCameraData::tryRunPipeline()
 
 	/* See if a new ScalerCrop value needs to be applied. */
 	applyScalerCrop(request->controls());
+
+	/*
+	 * Track AeMeteringMode for the SW stats kernels. The IPA reads the same
+	 * control to swap weight grids on the HW NQ path via libpisp config; we
+	 * mirror that here so the SW path tracks the user's choice instead of
+	 * being stuck on the tuning's default mode forever.
+	 */
+	applyMeteringModeToSwStats(request->controls());
 
 	fillRequestMetadata(job.sensorControls, request);
 

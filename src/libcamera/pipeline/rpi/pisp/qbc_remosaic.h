@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -48,13 +49,18 @@ public:
 	QbcRemosaic();
 
 	/*
-	 * Read the centre-weighted AGC metering grid out of
-	 * /usr/local/share/libcamera/ipa/rpi/pisp/<sensorModel>.json so the SW
-	 * histogram can weight per-region counts the way HW NQ does (RPi
-	 * tuning guide §5.9.4: Pi 5 counts each pixel w_i times). Called at
-	 * pipeline configure time, after QBC mode is detected.
+	 * Initial weight load. Picks the tuning JSON's first-listed metering
+	 * mode (matches the AGC IPA's defaultMeteringMode behaviour). Called
+	 * at pipeline-configure time, after QBC mode is detected.
 	 */
 	void loadMeteringWeights(const std::string &sensorModel);
+
+	/*
+	 * Switch metering-mode weight grid. Pipeline handler should call this
+	 * from onMetadataReady when controls::AeMeteringMode changes, so the
+	 * SW kernel's AGC histogram weights track the IPA's chosen mode.
+	 */
+	void setMeteringMode(const std::string &modeName);
 
 	/*
 	 * Read the IPA tuning's rpi.black_level.black_level entry (16-bit-shifted
@@ -96,11 +102,19 @@ private:
 	/* BLC plumbed from the V4L2 sensor subdev each frame (16-bit-shifted). */
 	std::atomic<uint16_t> blackLevel_{ 3200 };
 
-	/* AGC metering grid loaded from tuning JSON, then resolved per macro. */
+	/*
+	 * AGC metering state. meteringMutex_ serialises the (rare) reload
+	 * triggered by setMeteringMode() against the per-frame reader in
+	 * process(): process() takes it briefly at the top to rebuild the
+	 * per-macro cache; the inner loop then reads macroWeight_ lock-free.
+	 */
+	std::mutex meteringMutex_;
+	std::string sensorModel_;                 /* remembered for re-loads */
+	std::string meteringModeName_;            /* currently active mode */
 	std::vector<uint16_t> meteringWeights_;   /* row-major NxN grid */
 	unsigned int meteringGridW_ = 0;
 	unsigned int meteringGridH_ = 0;
-	std::vector<uint8_t> macroWeight_;        /* per-macro weight, sized to frame */
+	std::vector<uint8_t> macroWeight_;        /* per-macro weight cache */
 
 	std::string lastDumpFile_;
 };
