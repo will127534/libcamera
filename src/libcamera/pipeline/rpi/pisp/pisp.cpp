@@ -1573,13 +1573,13 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 
 	/*
 	 * ClearHDR (wide-dynamic-range) detection on the sensor subdev. When
-	 * WDR=1 the sensor delivers gradation-compressed (CCMP) raw — already
-	 * a non-linear domain. Stacking PISP-COMP1 (the CFE's own lossy
-	 * companding to 8 bpp) on top of CCMP would compound the precision
-	 * loss before we ever see the data, so force the CFE to deliver
-	 * unpacked 16-bit u16 instead. Detection here drives the format
-	 * override below; stats path is still decided by the 14/16-bit flag
-	 * or LIBCAMERA_RPI_PISP_CCMP_UNWRAP env var.
+	 * WDR=1 the sensor delivers a non-linear (e.g. gradation-compressed)
+	 * raw stream. Stacking PISP-COMP1 (the CFE's own lossy companding to
+	 * 8 bpp) on top compounds precision loss before BE or stats kernels
+	 * see the data, so force the CFE to deliver unpacked 16-bit u16
+	 * instead. Detection here drives the format override below — vendor-
+	 * agnostic, applies to any sensor that exposes the standard V4L2 WDR
+	 * control.
 	 */
 	bool wdrActive = false;
 	constexpr uint32_t kCidWdr = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
@@ -1614,31 +1614,29 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			<< sensor_->model() << " — CFE HW stats unreliable at this bit depth.";
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
-	} else if (!qbc_ && utils::secure_getenv("LIBCAMERA_RPI_PISP_CCMP_UNWRAP") &&
+	} else if (!qbc_ && sensor_->model() == "imx585" &&
+		   MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 12 &&
 		   initCcmpUnwrap()) {
 		/*
-		 * Opt-in CCMP unwrap for IMX585 12-bit ClearHDR. Off by default
-		 * because the inverse-curve-anchored u16 representation doesn't
-		 * line up cleanly with the IPA's AGC/BE tuning (which is sized
-		 * for the 12-bit-left-justified × 16 scale of native non-HDR
-		 * captures, or the empirically-similar 16-bit ClearHDR linear
-		 * scale). Set LIBCAMERA_RPI_PISP_CCMP_UNWRAP=1 in the env to
-		 * engage it; expect AGC drift and JPEG tone-mapping issues until
-		 * the IPA learns about the wider DR. See ccmp_unwrap.h for the
-		 * curve geometry — the kernel itself is correct; what's missing
-		 * is the IPA-side hookup. When that lands the gate flips on.
+		 * IMX585 12-bit ClearHDR: invert the CCMP gradation-compression
+		 * curve in place so BE + RawStatsProducer see linearised u16
+		 * data, then run the same SW stats path used by 14/16-bit
+		 * modes. Gated on the sensor model name because CCMP is
+		 * currently an IMX585-specific feature in our stack — any
+		 * future sensor that adopts a similar curve would need its own
+		 * gate (and likely its own curve geometry) added here.
 		 *
-		 * Note: 12-bit ClearHDR still works without the unwrap on
-		 * typical scenes — the CCMP curve preserves R/G/B ratios
-		 * uniformly across channels, so HW NQ stats yield correct AWB,
-		 * and AGC adapts to the compressed Y distribution. Only HDR
-		 * scenes with strongly-compressed highlights see a meaningful
-		 * benefit from the unwrap, and those are better served by the
-		 * explicit --mode :16:U (16-bit ClearHDR linear) path.
+		 * See ccmp_unwrap.h for the curve geometry. AGC/BE tuning at
+		 * the IPA layer is sized for the 12-bit-left-justified × 16
+		 * scale of native non-HDR captures; the unwrap reshapes that
+		 * scale, so AGC may drift on scenes with strongly-compressed
+		 * highlights until the IPA is retuned for the wider DR. Real
+		 * wide-DR work is better served by --mode :16:U (16-bit
+		 * ClearHDR linear).
 		 */
 		LOG(RPI, Info)
 			<< "ClearHDR 12-bit CCMP unwrap enabled for "
-			<< sensor_->model() << " (LIBCAMERA_RPI_PISP_CCMP_UNWRAP set)";
+			<< sensor_->model();
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
 	}
