@@ -1572,25 +1572,31 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	}
 
 	/*
-	 * ClearHDR (wide-dynamic-range) detection on the sensor subdev. When
-	 * WDR=1 the sensor delivers a non-linear (e.g. gradation-compressed)
-	 * raw stream. Stacking PISP-COMP1 (the CFE's own lossy companding to
-	 * 8 bpp) on top compounds precision loss before BE or stats kernels
-	 * see the data, so force the CFE to deliver unpacked 16-bit u16
-	 * instead. Detection here drives the format override below — vendor-
-	 * agnostic, applies to any sensor that exposes the standard V4L2 WDR
-	 * control.
+	 * IMX585 ClearHDR (wide-dynamic-range) detection. When WDR=1 the
+	 * sensor delivers gradation-compressed (CCMP) raw — already a
+	 * non-linear domain. Stacking PISP-COMP1 (the CFE's own lossy
+	 * companding to 8 bpp) on top compounds precision loss before BE
+	 * or stats kernels see the data, so force the CFE to deliver
+	 * unpacked 16-bit u16 instead.
+	 *
+	 * Scoped to IMX585: other sensors that expose the standard V4L2
+	 * WDR control (e.g. IMX708's on-sensor frame-stitched HDR) don't
+	 * share CCMP's stacked-compression hazard and may rely on their
+	 * driver's default CFE format. Add new sensors here as their HDR
+	 * behaviour is characterised.
 	 */
 	bool wdrActive = false;
-	constexpr uint32_t kCidWdr = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
-	if (sensor_->controls().find(kCidWdr) != sensor_->controls().end()) {
-		const uint32_t cids[] = { kCidWdr };
-		ControlList ctrls = sensor_->getControls(cids);
-		auto wdr = ctrls.get(kCidWdr);
-		/* WDR is V4L2_CTRL_TYPE_BOOLEAN but surfaces as int32_t via
-		 * the subdev getControls() path. */
-		if (!wdr.isNone() && wdr.get<int32_t>() != 0)
-			wdrActive = true;
+	if (sensor_->model() == "imx585") {
+		constexpr uint32_t kCidWdr = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
+		if (sensor_->controls().find(kCidWdr) != sensor_->controls().end()) {
+			const uint32_t cids[] = { kCidWdr };
+			ControlList ctrls = sensor_->getControls(cids);
+			auto wdr = ctrls.get(kCidWdr);
+			/* WDR is V4L2_CTRL_TYPE_BOOLEAN but surfaces as int32_t
+			 * via the subdev getControls() path. */
+			if (!wdr.isNone() && wdr.get<int32_t>() != 0)
+				wdrActive = true;
+		}
 	}
 
 	/*
