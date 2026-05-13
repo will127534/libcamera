@@ -94,6 +94,7 @@ do_capture() {
             --output "$OUT/${tag}.jpg" \
             --raw \
             --metadata "$OUT/${tag}.json" --metadata-format json \
+            --quality 95 \
             --timeout "$to" --denoise off \
             "$@" \
             >"$OUT/${tag}.log" 2>&1 || echo "WARN: $tag rpicam exited non-zero (see ${tag}.log)"
@@ -145,24 +146,30 @@ do_capture imx294_12b_nq 1 4144:2176:12:U 4144 2176 "$TIMEOUT_AUTO_MS" --awb aut
 read EXP294 AG294 RG294 BG294 < <(read_meta "$OUT/imx294_12b_nq.json")
 echo ">> IMX294 NQ baseline AE: shutter=${EXP294}µs gain=${AG294} awb=${RG294},${BG294}"
 
-# --- IMX294 12-bit full QBC (SW QbcRemosaic, MANUAL with 4× shutter) ---
-# NQ binned mode reads 4 photodiodes per output pixel — a single NQ-binned
-# pixel is ~8× the raw signal of a QBC pixel at the same shutter (see
-# memory/imx294_nq_qbc_8x.md). We boost shutter by 4× (not 8×) when promoting
-# NQ's AE to QBC: 4× is the geometric mean between "match shutter" (NQ raw
-# in JPEG, dark QBC) and "match scene brightness" (8×, but AWB gains then
-# push the brightest pixels past saturation and the post-WB clip turns
-# highlights magenta). 4× keeps ~1 stop of headroom for the WB gains to do
-# their thing without clipping. AWB carries over directly since it's ratio.
+# --- IMX294 12-bit full QBC (SW QbcRemosaic, MANUAL with 6× shutter) ---
+# Each NQ-binned pixel is ~8× the raw signal of a QBC pixel at the same
+# shutter (see memory/imx294_nq_qbc_8x.md). 6× is the largest shutter scale
+# at which the brightest scene pixels (NQ p99 ≈ 0.87 of full scale on a
+# typical neutral-walls scene) survive the WB gain step without clipping:
+# QBC raw at 6× ≈ 0.75 × NQ raw, × B-gain 2.0 ≈ 1.5 of NQ raw scale → just
+# under clip for non-saturated NQ p99. The trade-off vs 8× (= "exactly
+# match NQ scene brightness") is that 8× would clip B on highlights and
+# turn them magenta, which is what the QBC dim-output trade was made to
+# avoid; the resulting JPEG is ~0.3 stops dimmer than NQ but artefact-free.
+# AWB gains carry over directly since they're ratios.
 #
 # We override AE manually because rpicam-still's preview runs in a binned
 # mode and AGC converges there; the still-capture mode switch to QBC happens
 # too late for AGC to re-converge before the still is grabbed, so even with
-# --awb auto the captured frame keeps the binned-mode shutter.
-QBC_EXP=$(python3 -c "print(min(int($EXP294 * 4), 95000))")
+# --awb auto the captured frame keeps the binned-mode shutter. (Note: with
+# the qbc_remosaic ×8 stats output scaling, rpicam-vid's continuous-QBC AGC
+# *does* converge to the NQ-equivalent shutter on its own — but at that
+# NQ-shutter the BE skips the DG that would brighten the JPEG, so the
+# manual 6× override is still the right approach for matched JPEG output.)
+QBC_EXP=$(python3 -c "print(min(int($EXP294 * 6), 95000))")
 do_capture imx294_12b_qbc 1 8432:4348:12:U 8432 4348 "$TIMEOUT_MANUAL_MS" \
     --shutter "$QBC_EXP" --gain "$AG294" --awbgains "${RG294},${BG294}"
-echo ">> IMX294 QBC paired AE: shutter=${QBC_EXP}µs (= NQ shutter × 4)"
+echo ">> IMX294 QBC paired AE: shutter=${QBC_EXP}µs (= NQ shutter × 6)"
 
 # --- IMX294 14-bit (SW RawStatsProducer, AUTO) ---
 # 14-bit is its own sensor mode at a different resolution / frame timing, so
