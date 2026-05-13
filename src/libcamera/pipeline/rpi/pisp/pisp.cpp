@@ -45,6 +45,7 @@
 #include "../common/pipeline_base.h"
 #include "../common/rpi_stream.h"
 
+#include "ccmp_unwrap.h"
 #include "qbc_remosaic.h"
 #include "raw_stats.h"
 
@@ -868,6 +869,13 @@ private:
 	 * via RawStatsProducer::kClearHdrCid. nullptr otherwise. */
 	std::unique_ptr<RawStatsProducer> rawStats_;
 
+	/*
+	 * SW CCMP inverse for IMX585 12-bit ClearHDR. Non-null when the sensor
+	 * is in HDR mode AND delivers 12-bit gradation-compressed raw. Runs
+	 * before processRawStats / BE consumption to linearise the buffer.
+	 */
+	std::unique_ptr<CcmpUnwrap> ccmpUnwrap_;
+
 	void processQbcFrame(FrameBuffer *raw, FrameBuffer *stats);
 	void processRawStats(FrameBuffer *raw, FrameBuffer *stats);
 
@@ -880,6 +888,14 @@ private:
 	 */
 	void initSensorBlackLevel();
 	void updateSensorBlackLevel();
+
+	/*
+	 * If the sensor is in WDR mode AND its active format is 12-bit, read
+	 * the CCMP curve parameters off the V4L2 subdev, instantiate
+	 * ccmpUnwrap_ with them, and return true. Otherwise leave
+	 * ccmpUnwrap_ null and return false.
+	 */
+	bool initCcmpUnwrap();
 	uint16_t tuningBlc_ = 3200;          /* IPA tuning value, fallback */
 	int32_t sensorBlcDefault_ = 0;        /* V4L2 control default reading */
 	int32_t sensorBlcLast_ = 0;           /* last V4L2 reading, for log throttling */
@@ -1567,6 +1583,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	 * future sensor.
 	 */
 	rawStats_.reset();
+	ccmpUnwrap_.reset();
 	if (!qbc_ &&
 	    (cfe_[Cfe::Output0].getFlags() &
 	     (StreamFlag::Needs14bitUnpack | StreamFlag::Needs16bitEndianSwap))) {
@@ -1575,14 +1592,43 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			<< sensor_->model() << " — CFE HW stats unreliable at this bit depth.";
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
+	} else if (!qbc_ && utils::secure_getenv("LIBCAMERA_RPI_PISP_CCMP_UNWRAP") &&
+		   initCcmpUnwrap()) {
+		/*
+		 * Opt-in CCMP unwrap for IMX585 12-bit ClearHDR. Off by default
+		 * because the inverse-curve-anchored u16 representation doesn't
+		 * line up cleanly with the IPA's AGC/BE tuning (which is sized
+		 * for the 12-bit-left-justified × 16 scale of native non-HDR
+		 * captures, or the empirically-similar 16-bit ClearHDR linear
+		 * scale). Set LIBCAMERA_RPI_PISP_CCMP_UNWRAP=1 in the env to
+		 * engage it; expect AGC drift and JPEG tone-mapping issues until
+		 * the IPA learns about the wider DR. See ccmp_unwrap.h for the
+		 * curve geometry — the kernel itself is correct; what's missing
+		 * is the IPA-side hookup. When that lands the gate flips on.
+		 *
+		 * Note: 12-bit ClearHDR still works without the unwrap on
+		 * typical scenes — the CCMP curve preserves R/G/B ratios
+		 * uniformly across channels, so HW NQ stats yield correct AWB,
+		 * and AGC adapts to the compressed Y distribution. Only HDR
+		 * scenes with strongly-compressed highlights see a meaningful
+		 * benefit from the unwrap, and those are better served by the
+		 * explicit --mode :16:U (16-bit ClearHDR linear) path.
+		 */
+		LOG(RPI, Info)
+			<< "ClearHDR 12-bit CCMP unwrap enabled for "
+			<< sensor_->model() << " (LIBCAMERA_RPI_PISP_CCMP_UNWRAP set)";
+		rawStats_ = std::make_unique<RawStatsProducer>();
+		rawStats_->loadMeteringWeights(sensor_->model());
 	}
-	if (qbc_) {
-		LOG(RPI, Info) << "QBC remosaic enabled for " << sensor_->model();
+	if (qbc_ || ccmpUnwrap_) {
+		LOG(RPI, Info) << (qbc_ ? "QBC remosaic" : "ClearHDR-12b CCMP unwrap")
+			       << " enabled for " << sensor_->model();
 
 		/*
-		 * The QBC remosaic kernel does in-place 16-bit unpacked NEON
-		 * processing, so the CFE must deliver unpacked 16-bit. Override
-		 * any packed/compressed format the user (or auto-pick) chose.
+		 * Both SW kernels (QBC remosaic and CCMP unwrap) do in-place
+		 * u16 NEON processing, so the CFE must deliver unpacked 16-bit.
+		 * Override any packed/compressed format the user or the
+		 * auto-pick chose.
 		 */
 		V4L2SubdeviceFormat sensorFormatMod = rpiConfig->sensorFormat_;
 		sensorFormatMod.code = mbusCodeUnpacked16(sensorFormatMod.code);
@@ -1590,7 +1636,8 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			cfe, sensorFormatMod, BayerFormat::Packing::None);
 		computeOptimalStride(cfeFormat);
 
-		qbc_->loadMeteringWeights(sensor_->model());
+		if (qbc_)
+			qbc_->loadMeteringWeights(sensor_->model());
 	}
 
 	if (qbc_ || rawStats_)
@@ -1600,11 +1647,14 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (ret)
 		return ret;
 
-	if (qbc_ && !rawStreams.empty()) {
+	if ((qbc_ || ccmpUnwrap_) && !rawStreams.empty()) {
 		/*
 		 * Sync the external raw-stream config to the actual CFE format.
 		 * After setFormat the kernel has filled planes[0].size; rpicam-apps
-		 * reads cfg.frameSize to allocate the dma-heap buffer.
+		 * reads cfg.frameSize to allocate the dma-heap buffer. Same
+		 * requirement for both QBC remosaic (unpacked 16-bit u16 buffer
+		 * in-place rewrite) and CCMP unwrap (same buffer shape, just a
+		 * different per-pixel transformation).
 		 */
 		rawStreams[0].cfg->pixelFormat = cfeFormat.fourcc.toPixelFormat();
 		rawStreams[0].cfg->stride = cfeFormat.planes[0].bpl;
@@ -2592,6 +2642,85 @@ void PiSPCameraData::updateSensorBlackLevel()
 	sensorBlcLast_ = now;
 }
 
+bool PiSPCameraData::initCcmpUnwrap()
+{
+	/*
+	 * Only the IMX585 ClearHDR path produces CCMP-compressed 12-bit raw.
+	 * Detect by:
+	 *   (a) wide_dynamic_range = 1 on the sensor subdev (the ClearHDR
+	 *       enable), and
+	 *   (b) the CFE output stream is 12-bit (the high-bit-depth flags
+	 *       Needs14bitUnpack / Needs16bitEndianSwap are NOT set).
+	 * The caller has already verified (b) by not engaging the 14/16-bit
+	 * RawStatsProducer path; here we just check (a).
+	 *
+	 * Reads the gradation-compression parameters off the sensor subdev's
+	 * vendor V4L2 controls — see the IMX585 driver:
+	 *   V4L2_CID_IMX585_HDR_GRAD_TH      0x00982902 (u32[2], CCMP1/2_EXP)
+	 *   V4L2_CID_IMX585_HDR_GRAD_COMP_L  0x00982903 (menu,   ACMP1_EXP)
+	 *   V4L2_CID_IMX585_HDR_GRAD_COMP_H  0x00982904 (menu,   ACMP2_EXP)
+	 */
+	constexpr uint32_t kCidWdr     = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
+	constexpr uint32_t kCidGradTh  = 0x00982902;
+	constexpr uint32_t kCidGradL   = 0x00982903;
+	constexpr uint32_t kCidGradH   = 0x00982904;
+
+	const ControlInfoMap &info = sensor_->controls();
+	if (info.find(kCidWdr) == info.end() ||
+	    info.find(kCidGradTh) == info.end() ||
+	    info.find(kCidGradL) == info.end() ||
+	    info.find(kCidGradH) == info.end())
+		return false; /* not an IMX585 / no CCMP controls */
+
+	const uint32_t cids[] = { kCidWdr, kCidGradTh, kCidGradL, kCidGradH };
+	ControlList ctrls = sensor_->getControls(cids);
+	auto wdr = ctrls.get(kCidWdr);
+	/* The control is V4L2_CTRL_TYPE_BOOLEAN but libcamera surfaces it as
+	 * int32_t through the subdev getControls() path — get<bool>() asserts
+	 * on the type mismatch. */
+	if (wdr.isNone() || wdr.get<int32_t>() == 0)
+		return false; /* sensor isn't in HDR mode */
+
+	auto th = ctrls.get(kCidGradTh);
+	auto slope_l = ctrls.get(kCidGradL);
+	auto slope_h = ctrls.get(kCidGradH);
+
+	CcmpUnwrap::Params p{};
+	/* GRAD_TH is a u32 array of 2 (THR1, THR2). */
+	if (!th.isNone()) {
+		auto thr = th.get<Span<const uint32_t>>();
+		if (thr.size() >= 2) {
+			p.thresh1 = thr[0];
+			p.thresh2 = thr[1];
+		}
+	}
+	p.slope_l_idx = slope_l.isNone() ? 2  : static_cast<uint8_t>(slope_l.get<int32_t>());
+	p.slope_h_idx = slope_h.isNone() ? 6  : static_cast<uint8_t>(slope_h.get<int32_t>());
+
+	/*
+	 * BLC anchor for the LUT. Use the sensor's V4L2_CID_BRIGHTNESS reading
+	 * scaled to 12-bit output units (×4: the IMX585 driver scales the
+	 * 8-bit BLKLEVEL register by 4 to land in 12-bit space). Falls back
+	 * to the driver default (50 → 200 in 12-bit) if the control isn't
+	 * readable, so the LUT still pivots on a sane pedestal even when the
+	 * V4L2 read fails.
+	 */
+	constexpr uint32_t kCidBrightness = 0x00980900; /* V4L2_CID_BRIGHTNESS */
+	int32_t blc_reg = 50; /* IMX585 driver default */
+	if (info.find(kCidBrightness) != info.end()) {
+		const uint32_t blcCids[] = { kCidBrightness };
+		ControlList blcCtrls = sensor_->getControls(blcCids);
+		auto v = blcCtrls.get(kCidBrightness);
+		if (!v.isNone())
+			blc_reg = v.get<int32_t>();
+	}
+	p.blc_u12 = static_cast<uint16_t>(std::min(blc_reg * 4, 4095));
+
+	ccmpUnwrap_ = std::make_unique<CcmpUnwrap>();
+	ccmpUnwrap_->setParams(p);
+	return true;
+}
+
 /*
  * Thin wrapper around the SW QBC kernel — pulls the mapped pointers out of
  * the CFE buffers and hands them to QbcRemosaic. dmabuf-sync brackets the
@@ -2645,13 +2774,26 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 	unsigned int stride = cfg.stride;
 	ASSERT(stride >= width * 2u);
 
-	const uint16_t *rawPx = reinterpret_cast<const uint16_t *>(rawBuf.mapped->planes()[0].data());
+	uint16_t *rawPx = reinterpret_cast<uint16_t *>(rawBuf.mapped->planes()[0].data());
 	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
 
 	updateSensorBlackLevel();
 
 	dmabufSyncStart(raw->planes()[0].fd);
 	dmabufSyncStart(stats->planes()[0].fd);
+
+	/*
+	 * If the sensor is in 12-bit ClearHDR (CCMP active), invert the
+	 * gradation-compression curve IN PLACE on the raw buffer so the
+	 * downstream stats kernel AND the BE both see linearised data.
+	 * Buffer is stride-bytes-wide u16 with valid pixels in the first
+	 * width columns of each row.
+	 */
+	if (ccmpUnwrap_) {
+		const unsigned int strideU16 = stride / 2;
+		for (unsigned int y = 0; y < height; y++)
+			ccmpUnwrap_->process(rawPx + y * strideU16, width);
+	}
 
 	rawStats_->process(rawPx, st, width, height, stride);
 
