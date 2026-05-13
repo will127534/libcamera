@@ -68,6 +68,20 @@ public:
 	void updateWbGains(const ControlList &metadata);
 
 	/*
+	 * Optional pixel-value linearisation LUT, indexed by the
+	 * compressed 12-bit pixel (pixel_u16 >> 4). 4096 u16 entries.
+	 *
+	 * Used by the IMX585 ClearHDR 12-bit path to invert the on-sensor
+	 * CCMP gradation curve at stats-accumulation time, so the IPA sees
+	 * the true scene luminance distribution without rewriting the raw
+	 * buffer (the BE consumes the unmodified compressed buffer).
+	 *
+	 * `lut` must remain valid for the lifetime of this object or until
+	 * the next setLinearizationLut() call. Pass nullptr to disable.
+	 */
+	void setLinearizationLut(const uint16_t *lut);
+
+	/*
 	 * Compute pisp_statistics from a standard RGGB Bayer buffer at any
 	 * supported bit-depth (10/12/14/16 unpacked, samples left-justified
 	 * in the high bits of u16). Does NOT modify the raw buffer.
@@ -85,6 +99,7 @@ private:
 	std::atomic<float> wbGainG_{ 1.0f };
 	std::atomic<float> wbGainB_{ 1.0f };
 	std::atomic<uint16_t> blackLevel_{ 3200 }; /* 16-bit-shifted; live-adjustable */
+	std::atomic<const uint16_t *> linearizationLut_{ nullptr };
 
 	std::vector<uint16_t> pairCellX_;          /* RGGB-cell-pair → AWB-cell-X */
 

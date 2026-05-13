@@ -212,6 +212,11 @@ void RawStatsProducer::updateWbGains(const ControlList &metadata)
 	wbGainG_.store(1.0f, std::memory_order_relaxed);
 }
 
+void RawStatsProducer::setLinearizationLut(const uint16_t *lut)
+{
+	linearizationLut_.store(lut, std::memory_order_release);
+}
+
 void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			       unsigned int width, unsigned int height,
 			       unsigned int strideBytes)
@@ -307,11 +312,33 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			}
 		};
 
+		/*
+		 * Optional CCMP-inverse LUT. When set, each compressed u16
+		 * pixel is replaced with its linearised u16 before any further
+		 * accumulation — the BLC subtraction, BT.601 Y dot-product,
+		 * and zone summation all run on the linear-domain values.
+		 * Lookup is scalar (no NEON gather for 4096-entry tables); LUT
+		 * fits in L1.
+		 */
+		const uint16_t *lut = linearizationLut_.load(std::memory_order_acquire);
+
 		for (unsigned int p = 0; p < cellPairs; p++) {
 			const unsigned int x0 = p * 8;
 
 			uint16x8_t v0 = vld1q_u16(row0 + x0);  /* R G R G R G R G */
 			uint16x8_t v1 = vld1q_u16(row1 + x0);  /* G B G B G B G B */
+
+			if (lut) {
+				uint16_t a0[8], a1[8];
+				vst1q_u16(a0, v0);
+				vst1q_u16(a1, v1);
+				for (int k = 0; k < 8; k++) {
+					a0[k] = lut[a0[k] >> 4];
+					a1[k] = lut[a1[k] >> 4];
+				}
+				v0 = vld1q_u16(a0);
+				v1 = vld1q_u16(a1);
+			}
 
 			/* Deinterleave evens/odds in each row, widen to u32 so
 			 * the per-zone accumulations don't wrap. */

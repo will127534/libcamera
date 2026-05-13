@@ -870,9 +870,12 @@ private:
 	std::unique_ptr<RawStatsProducer> rawStats_;
 
 	/*
-	 * SW CCMP inverse for IMX585 12-bit ClearHDR. Non-null when the sensor
-	 * is in HDR mode AND delivers 12-bit gradation-compressed raw. Runs
-	 * before processRawStats / BE consumption to linearise the buffer.
+	 * CCMP inverse LUT for IMX585 12-bit ClearHDR. Non-null when the
+	 * sensor is in HDR mode AND delivers 12-bit gradation-compressed raw.
+	 * Owns the LUT memory; the LUT pointer is installed into
+	 * RawStatsProducer at configure time and applied per pixel during
+	 * stats accumulation. The raw buffer itself is never modified — BE
+	 * consumes the unmodified compressed buffer.
 	 */
 	std::unique_ptr<CcmpUnwrap> ccmpUnwrap_;
 
@@ -1624,41 +1627,43 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		   MediaBusFormatInfo::info(rpiConfig->sensorFormat_.code).bitsPerPixel == 12 &&
 		   initCcmpUnwrap()) {
 		/*
-		 * IMX585 12-bit ClearHDR: invert the CCMP gradation-compression
-		 * curve in place so BE + RawStatsProducer see linearised u16
-		 * data, then run the same SW stats path used by 14/16-bit
-		 * modes. Gated on the sensor model name because CCMP is
-		 * currently an IMX585-specific feature in our stack — any
-		 * future sensor that adopts a similar curve would need its own
-		 * gate (and likely its own curve geometry) added here.
+		 * IMX585 12-bit ClearHDR: build the CCMP inverse LUT and hand
+		 * it to RawStatsProducer. Stats are linearised at accumulation
+		 * time (per pixel), the raw buffer is NOT rewritten — the BE
+		 * consumes the unmodified CCMP-compressed buffer the way it
+		 * already does today on the HW NQ stats path. IPA sees the
+		 * true scene luminance distribution; BE rendering is
+		 * unchanged.
 		 *
-		 * See ccmp_unwrap.h for the curve geometry. AGC/BE tuning at
-		 * the IPA layer is sized for the 12-bit-left-justified × 16
-		 * scale of native non-HDR captures; the unwrap reshapes that
-		 * scale, so AGC may drift on scenes with strongly-compressed
-		 * highlights until the IPA is retuned for the wider DR. Real
-		 * wide-DR work is better served by --mode :16:U (16-bit
-		 * ClearHDR linear).
+		 * Gated on the sensor model name because CCMP is currently an
+		 * IMX585-specific feature in our stack; any future sensor that
+		 * adopts a similar curve would need its own gate (and likely
+		 * its own curve geometry) added here.
 		 */
 		LOG(RPI, Info)
-			<< "ClearHDR 12-bit CCMP unwrap enabled for "
+			<< "ClearHDR 12-bit CCMP stats linearisation enabled for "
 			<< sensor_->model();
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
+		rawStats_->setLinearizationLut(ccmpUnwrap_->lut());
 	}
 	if (qbc_ || ccmpUnwrap_ || wdrActive) {
 		LOG(RPI, Info) << (qbc_           ? "QBC remosaic"
-				   : ccmpUnwrap_  ? "ClearHDR-12b CCMP unwrap"
+				   : ccmpUnwrap_  ? "ClearHDR-12b CCMP stats linearisation"
 						  : "ClearHDR (WDR) — unpacked CFE")
 			       << " enabled for " << sensor_->model();
 
 		/*
-		 * Both SW kernels (QBC remosaic and CCMP unwrap) do in-place
-		 * u16 NEON processing, so the CFE must deliver unpacked 16-bit.
-		 * For plain WDR-without-unwrap we also force unpacked so the
-		 * CFE doesn't stack PISP-COMP1 lossy companding on top of the
-		 * sensor's CCMP gradation compression. Override any packed/
-		 * compressed format the user or the auto-pick chose.
+		 * Force unpacked 16-bit u16 CFE for three reasons:
+		 *   - QBC: NEON remosaic kernel does in-place u16 work.
+		 *   - CCMP stats linearisation: stats kernel indexes the LUT
+		 *     with (pixel_u16 >> 4) to get the 12-bit CCMP code; needs
+		 *     unpacked u16, not PISP-COMP1 companded.
+		 *   - WDR without CCMP linearisation: avoids stacking PISP-COMP1
+		 *     lossy companding on top of the sensor's gradation
+		 *     compression.
+		 * Override any packed/compressed format the user or the
+		 * auto-pick chose.
 		 */
 		V4L2SubdeviceFormat sensorFormatMod = rpiConfig->sensorFormat_;
 		sensorFormatMod.code = mbusCodeUnpacked16(sensorFormatMod.code);
@@ -2804,7 +2809,7 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 	unsigned int stride = cfg.stride;
 	ASSERT(stride >= width * 2u);
 
-	uint16_t *rawPx = reinterpret_cast<uint16_t *>(rawBuf.mapped->planes()[0].data());
+	const uint16_t *rawPx = reinterpret_cast<const uint16_t *>(rawBuf.mapped->planes()[0].data());
 	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
 
 	updateSensorBlackLevel();
@@ -2813,18 +2818,11 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 	dmabufSyncStart(stats->planes()[0].fd);
 
 	/*
-	 * If the sensor is in 12-bit ClearHDR (CCMP active), invert the
-	 * gradation-compression curve IN PLACE on the raw buffer so the
-	 * downstream stats kernel AND the BE both see linearised data.
-	 * Buffer is stride-bytes-wide u16 with valid pixels in the first
-	 * width columns of each row.
+	 * No buffer rewrite. When CCMP is active the LUT was installed into
+	 * RawStatsProducer at configure time (see initCcmpUnwrap), and the
+	 * stats kernel applies it per pixel during accumulation — IPA sees
+	 * linearised stats, BE consumes the unmodified compressed buffer.
 	 */
-	if (ccmpUnwrap_) {
-		const unsigned int strideU16 = stride / 2;
-		for (unsigned int y = 0; y < height; y++)
-			ccmpUnwrap_->process(rawPx + y * strideU16, width);
-	}
-
 	rawStats_->process(rawPx, st, width, height, stride);
 
 	dmabufSyncEnd(stats->planes()[0].fd);
