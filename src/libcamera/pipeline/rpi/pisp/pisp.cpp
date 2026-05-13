@@ -1572,6 +1572,28 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	}
 
 	/*
+	 * ClearHDR (wide-dynamic-range) detection on the sensor subdev. When
+	 * WDR=1 the sensor delivers gradation-compressed (CCMP) raw — already
+	 * a non-linear domain. Stacking PISP-COMP1 (the CFE's own lossy
+	 * companding to 8 bpp) on top of CCMP would compound the precision
+	 * loss before we ever see the data, so force the CFE to deliver
+	 * unpacked 16-bit u16 instead. Detection here drives the format
+	 * override below; stats path is still decided by the 14/16-bit flag
+	 * or LIBCAMERA_RPI_PISP_CCMP_UNWRAP env var.
+	 */
+	bool wdrActive = false;
+	constexpr uint32_t kCidWdr = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
+	if (sensor_->controls().find(kCidWdr) != sensor_->controls().end()) {
+		const uint32_t cids[] = { kCidWdr };
+		ControlList ctrls = sensor_->getControls(cids);
+		auto wdr = ctrls.get(kCidWdr);
+		/* WDR is V4L2_CTRL_TYPE_BOOLEAN but surfaces as int32_t via
+		 * the subdev getControls() path. */
+		if (!wdr.isNone() && wdr.get<int32_t>() != 0)
+			wdrActive = true;
+	}
+
+	/*
 	 * High-bit-depth SW stats fallback. The CFE statistics engine has a
 	 * known bug at ≥14-bit unpacked raw — exactly the regime the warnings
 	 * above already complain about ("statistics will not be correct"). The
@@ -1620,15 +1642,19 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
 	}
-	if (qbc_ || ccmpUnwrap_) {
-		LOG(RPI, Info) << (qbc_ ? "QBC remosaic" : "ClearHDR-12b CCMP unwrap")
+	if (qbc_ || ccmpUnwrap_ || wdrActive) {
+		LOG(RPI, Info) << (qbc_           ? "QBC remosaic"
+				   : ccmpUnwrap_  ? "ClearHDR-12b CCMP unwrap"
+						  : "ClearHDR (WDR) — unpacked CFE")
 			       << " enabled for " << sensor_->model();
 
 		/*
 		 * Both SW kernels (QBC remosaic and CCMP unwrap) do in-place
 		 * u16 NEON processing, so the CFE must deliver unpacked 16-bit.
-		 * Override any packed/compressed format the user or the
-		 * auto-pick chose.
+		 * For plain WDR-without-unwrap we also force unpacked so the
+		 * CFE doesn't stack PISP-COMP1 lossy companding on top of the
+		 * sensor's CCMP gradation compression. Override any packed/
+		 * compressed format the user or the auto-pick chose.
 		 */
 		V4L2SubdeviceFormat sensorFormatMod = rpiConfig->sensorFormat_;
 		sensorFormatMod.code = mbusCodeUnpacked16(sensorFormatMod.code);
@@ -1647,14 +1673,14 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (ret)
 		return ret;
 
-	if ((qbc_ || ccmpUnwrap_) && !rawStreams.empty()) {
+	if ((qbc_ || ccmpUnwrap_ || wdrActive) && !rawStreams.empty()) {
 		/*
 		 * Sync the external raw-stream config to the actual CFE format.
 		 * After setFormat the kernel has filled planes[0].size; rpicam-apps
 		 * reads cfg.frameSize to allocate the dma-heap buffer. Same
-		 * requirement for both QBC remosaic (unpacked 16-bit u16 buffer
-		 * in-place rewrite) and CCMP unwrap (same buffer shape, just a
-		 * different per-pixel transformation).
+		 * requirement whether the buffer carries QBC remosaic output,
+		 * CCMP-unwrapped data, or plain unpacked-WDR raw — they all share
+		 * the unpacked 16-bit u16 layout.
 		 */
 		rawStreams[0].cfg->pixelFormat = cfeFormat.fourcc.toPixelFormat();
 		rawStreams[0].cfg->stride = cfeFormat.planes[0].bpl;
