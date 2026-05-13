@@ -861,6 +861,21 @@ private:
 	void processQbcFrame(FrameBuffer *raw, FrameBuffer *stats);
 	void processRawStats(FrameBuffer *raw, FrameBuffer *stats);
 
+	/*
+	 * Black-level plumbing for the SW stats kernels. The IPA tuning encodes
+	 * one fixed BLC, but the sensor's V4L2 control is the live source of
+	 * truth (users can adjust it at runtime). At configure we calibrate a
+	 * scale so V4L2-units map to 16-bit-shifted pixel-units; per-frame we
+	 * re-read the V4L2 control and push the result to the kernel.
+	 */
+	void initSensorBlackLevel();
+	void updateSensorBlackLevel();
+	uint16_t tuningBlc_ = 3200;          /* IPA tuning value, fallback */
+	int32_t sensorBlcDefault_ = 0;        /* V4L2 control default reading */
+	int32_t sensorBlcLast_ = 0;           /* last V4L2 reading, for log throttling */
+	double sensorBlcScale_ = 0.0;         /* >0 ⇒ V4L2 reading × scale = pixel BLC */
+	uint32_t sensorBlcCid_ = 0;           /* CID we picked at init (0 = none) */
+
 	bool cfeJobComplete() const
 	{
 		if (cfeJobQueue_.empty())
@@ -1548,6 +1563,9 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 
 		qbc_->loadMeteringWeights(sensor_->model());
 	}
+
+	if (qbc_ || rawStats_)
+		initSensorBlackLevel();
 
 	ret = cfe->setFormat(&cfeFormat);
 	if (ret)
@@ -2411,6 +2429,104 @@ void PiSPCameraData::onMetadataReady(const ControlList &metadata)
 }
 
 /*
+ * BLC plumbing — see the header for the contract. At configure time we pick
+ * the sensor's V4L2 BLC control (currently V4L2_CID_BRIGHTNESS, which IMX585
+ * uses for IMX585_REG_BLKLEVEL; other sensors may add their own custom CID
+ * here later), grab its default value, and pair it with the IPA tuning's
+ * black_level so we know how V4L2-units relate to pixel-units. From then on,
+ * updateSensorBlackLevel() per-frame is a single getControls() + multiply.
+ *
+ * If the sensor doesn't expose a BLC control, we just stick with the tuning
+ * value (already loaded into the kernel via loadBlackLevel()) and skip the
+ * per-frame poll entirely.
+ */
+void PiSPCameraData::initSensorBlackLevel()
+{
+	tuningBlc_ = 3200;
+	if (qbc_) {
+		uint16_t v = qbc_->loadBlackLevel(sensor_->model());
+		if (v != 0)
+			tuningBlc_ = v;
+	} else if (rawStats_) {
+		uint16_t v = rawStats_->loadBlackLevel(sensor_->model());
+		if (v != 0)
+			tuningBlc_ = v;
+	}
+
+	sensorBlcCid_ = 0;
+	sensorBlcScale_ = 0.0;
+
+	const ControlInfoMap &info = sensor_->controls();
+	static constexpr uint32_t kCandidateCids[] = { V4L2_CID_BRIGHTNESS };
+	for (uint32_t cid : kCandidateCids) {
+		auto it = info.find(cid);
+		if (it == info.end())
+			continue;
+		int32_t def = it->second.def().get<int32_t>();
+		if (def <= 0) {
+			LOG(RPI, Warning)
+				<< "BLC: V4L2 control 0x" << std::hex << cid << std::dec
+				<< " has zero default — falling back to tuning BLC " << tuningBlc_;
+			continue;
+		}
+		sensorBlcCid_ = cid;
+		sensorBlcDefault_ = def;
+		sensorBlcScale_ = double(tuningBlc_) / double(def);
+
+		const uint32_t cids[1] = { cid };
+		ControlList ctrls = sensor_->getControls(cids);
+		auto v = ctrls.get(cid);
+		int32_t now = v.isNone() ? def : v.get<int32_t>();
+		sensorBlcLast_ = now;
+		uint16_t livePx = uint16_t(std::clamp<double>(now * sensorBlcScale_,
+							      0.0, 65535.0));
+		if (qbc_)
+			qbc_->setBlackLevel(livePx);
+		if (rawStats_)
+			rawStats_->setBlackLevel(livePx);
+
+		LOG(RPI, Info) << "BLC: tuning=" << tuningBlc_
+			       << " V4L2(cid=0x" << std::hex << cid << std::dec
+			       << ", def=" << def << ", now=" << now << ")"
+			       << " → live pixel BLC=" << livePx
+			       << " (scale=" << sensorBlcScale_ << ")";
+		if (now != def)
+			LOG(RPI, Warning)
+				<< "BLC: V4L2 sensor BLC (" << now << ") differs from tuning default ("
+				<< def << "); using V4L2-derived pixel BLC " << livePx
+				<< " instead of tuning " << tuningBlc_;
+		return;
+	}
+
+	LOG(RPI, Info) << "BLC: " << sensor_->model()
+		       << " has no V4L2 BLC control; using tuning value " << tuningBlc_
+		       << " (not live-adjustable)";
+}
+
+void PiSPCameraData::updateSensorBlackLevel()
+{
+	if (sensorBlcCid_ == 0 || sensorBlcScale_ <= 0.0)
+		return;
+	const uint32_t cids[1] = { sensorBlcCid_ };
+	ControlList ctrls = sensor_->getControls(cids);
+	auto v = ctrls.get(sensorBlcCid_);
+	if (v.isNone())
+		return;
+	int32_t now = v.get<int32_t>();
+	if (now == sensorBlcLast_)
+		return;
+	uint16_t livePx = uint16_t(std::clamp<double>(now * sensorBlcScale_,
+						      0.0, 65535.0));
+	if (qbc_)
+		qbc_->setBlackLevel(livePx);
+	if (rawStats_)
+		rawStats_->setBlackLevel(livePx);
+	LOG(RPI, Info) << "BLC: V4L2 sensor BLC changed " << sensorBlcLast_
+		       << " → " << now << ", using pixel BLC " << livePx;
+	sensorBlcLast_ = now;
+}
+
+/*
  * Thin wrapper around the SW QBC kernel — pulls the mapped pointers out of
  * the CFE buffers and hands them to QbcRemosaic. dmabuf-sync brackets the
  * in-place remosaic so the buffer is coherent for the BE that consumes it
@@ -2432,6 +2548,8 @@ void PiSPCameraData::processQbcFrame(FrameBuffer *raw, FrameBuffer *stats)
 
 	uint16_t *rawPx = reinterpret_cast<uint16_t *>(rawBuf.mapped->planes()[0].data());
 	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
+
+	updateSensorBlackLevel();
 
 	dmabufSyncStart(raw->planes()[0].fd);
 	dmabufSyncStart(stats->planes()[0].fd);
@@ -2463,6 +2581,8 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 
 	const uint16_t *rawPx = reinterpret_cast<const uint16_t *>(rawBuf.mapped->planes()[0].data());
 	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
+
+	updateSensorBlackLevel();
 
 	dmabufSyncStart(raw->planes()[0].fd);
 	dmabufSyncStart(stats->planes()[0].fd);

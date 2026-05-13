@@ -34,6 +34,21 @@ public:
 
 	void loadMeteringWeights(const std::string &sensorModel);
 
+	/*
+	 * Read the IPA tuning's rpi.black_level.black_level entry (16-bit-shifted
+	 * pixel-units) so the SW kernel uses the same pedestal the BE does.
+	 * Returns the loaded value, or 0 if the entry is absent / unreadable.
+	 * Stored as the initial BLC; setBlackLevel() can override it per-frame.
+	 */
+	uint16_t loadBlackLevel(const std::string &sensorModel);
+
+	/*
+	 * Live-adjustable BLC (16-bit-shifted pixel-units). The pipeline handler
+	 * re-reads the sensor's V4L2 BLC control each frame and pushes the
+	 * (scaled) value here so changes propagate within ~1 frame.
+	 */
+	void setBlackLevel(uint16_t blc);
+
 	/* Capture ColourGains from the IPA's metadataReady signal. */
 	void updateWbGains(const ControlList &metadata);
 
@@ -54,6 +69,7 @@ private:
 	std::atomic<float> wbGainR_{ 1.0f };
 	std::atomic<float> wbGainG_{ 1.0f };
 	std::atomic<float> wbGainB_{ 1.0f };
+	std::atomic<uint16_t> blackLevel_{ 3200 }; /* 16-bit-shifted; live-adjustable */
 
 	std::vector<uint16_t> pairCellX_;          /* RGGB-cell-pair → AWB-cell-X */
 	std::vector<uint16_t> meteringWeights_;    /* NxN row-major */

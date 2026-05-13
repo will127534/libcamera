@@ -1,16 +1,46 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
  * qbc_remosaic.cpp - SW QBC remosaic + stats producer (see qbc_remosaic.h).
+ *
+ * Algorithm (Hamilton-Adams direction-aware demosaic adapted for QBC):
+ *
+ * For each 4×4 macro, the QBC layout is
+ *     [R R G G]
+ *     [R R G G]
+ *     [G G B B]
+ *     [G G B B]
+ * and the output is the standard 2×2 RGGB tile pattern
+ *     [R G R G]
+ *     [G B G B]
+ *     [R G R G]
+ *     [G B G B]
+ * at the same pixel resolution.
+ *
+ * 1. Compute sub-block sums (R, G_top, G_bot, B) and pixel averages.
+ * 2. Compute "horizontal" and "vertical" gradients on the sub-block averages:
+ *      gH = |(R + G_bot) − (G_top + B)|   (vertical edges in scene)
+ *      gV = |(R + G_top) − (G_bot + B)|   (horizontal edges in scene)
+ * 3. Smooth macros (gH and gV both small) → emit the sub-block-average tile,
+ *    eliminating aliasing/false-colour in flat regions.
+ * 4. Edge macros → for each output position blend two candidate sources from
+ *    a fixed LUT (H_src — closest same-colour pixel in the row, V_src —
+ *    closest same-colour pixel in the column) by α = gH/(gH+gV+ε). Vertical
+ *    edges (large gH) lean toward V_src so the interpolation stays on one
+ *    side of the edge; horizontal edges (large gV) lean toward H_src.
+ *
+ * Up to 3 worker threads process disjoint horizontal strips of macro rows.
+ * Each thread owns its own AGC histogram + AWB zone state; the parent merges
+ * once all threads have joined.
  */
 
 #include "qbc_remosaic.h"
 
 #include <algorithm>
-#include <arm_neon.h>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 #include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
@@ -49,7 +79,6 @@ void QbcRemosaic::loadMeteringWeights(const std::string &sensorModel)
 		return;
 	}
 
-	/* Walk: algorithms[].rpi.agc.metering_modes.<active>.weights */
 	const YamlObject &algos = (*root)["algorithms"];
 	for (const YamlObject &entry : algos.asList()) {
 		const YamlObject &agc = entry["rpi.agc"];
@@ -92,6 +121,33 @@ void QbcRemosaic::loadMeteringWeights(const std::string &sensorModel)
 		       << " AGC metering grid from " << tuningPath;
 }
 
+uint16_t QbcRemosaic::loadBlackLevel(const std::string &sensorModel)
+{
+	const std::string tuningPath =
+		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
+	File f(tuningPath);
+	if (!f.open(File::OpenModeFlag::ReadOnly))
+		return 0;
+	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
+	if (!root)
+		return 0;
+	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
+		const YamlObject &bl = entry["rpi.black_level"];
+		if (!bl.isDictionary())
+			continue;
+		uint16_t v = bl["black_level"].get<uint16_t>(0);
+		if (v != 0)
+			blackLevel_.store(v, std::memory_order_relaxed);
+		return v;
+	}
+	return 0;
+}
+
+void QbcRemosaic::setBlackLevel(uint16_t blc)
+{
+	blackLevel_.store(blc, std::memory_order_relaxed);
+}
+
 void QbcRemosaic::updateWbGains(const ControlList &metadata)
 {
 	const auto &gains = metadata.get(controls::ColourGains);
@@ -99,42 +155,114 @@ void QbcRemosaic::updateWbGains(const ControlList &metadata)
 		return;
 	wbGainR_.store((*gains)[0], std::memory_order_relaxed);
 	wbGainB_.store((*gains)[1], std::memory_order_relaxed);
-	/* G gain is the reference (always 1.0); store it for symmetry. */
 	wbGainG_.store(1.0f, std::memory_order_relaxed);
 }
+
+namespace {
+
+/*
+ * Per-output LUT (16 entries, indexed by macro-relative row*4+col).
+ *   h_src: source pixel (row*4+col) supplying the "horizontal" candidate
+ *          (closest same-colour pixel in the same row, falling back to the
+ *          nearest same-colour pixel when the row has no match).
+ *   v_src: same, for the "vertical" candidate.
+ * Where h_src == v_src the directional blend collapses to a single value.
+ */
+struct OutputLUT {
+	uint8_t h_src;
+	uint8_t v_src;
+};
+
+/*
+ * Macro indices (row*4 + col, 0..15):
+ *     0  1  2  3
+ *     4  5  6  7
+ *     8  9 10 11
+ *    12 13 14 15
+ * Source colour:
+ *     R  R  G  G
+ *     R  R  G  G
+ *     G  G  B  B
+ *     G  G  B  B
+ * Output colour (2×2 RGGB tile):
+ *     R  G  R  G
+ *     G  B  G  B
+ *     R  G  R  G
+ *     G  B  G  B
+ */
+constexpr OutputLUT kRemosaicLUT[16] = {
+	/* (0,0) R */ { 0,  0},
+	/* (0,1) G */ { 2,  9},  /* H: src(0,2) G_top; V: src(2,1) G_bot */
+	/* (0,2) R */ { 1,  5},  /* H: src(0,1) R;     V: src(1,1) R     */
+	/* (0,3) G */ { 3,  3},
+	/* (1,0) G */ { 6,  8},  /* H: src(1,2) G_top; V: src(2,0) G_bot */
+	/* (1,1) B */ {10, 10},
+	/* (1,2) G */ { 6,  6},
+	/* (1,3) B */ {11, 11},
+	/* (2,0) R */ { 4,  4},
+	/* (2,1) G */ { 9,  9},
+	/* (2,2) R */ { 5,  5},
+	/* (2,3) G */ { 9,  7},  /* H: src(2,1) G_bot; V: src(1,3) G_top */
+	/* (3,0) G */ {12, 12},
+	/* (3,1) B */ {14, 14},
+	/* (3,2) G */ {13,  6},  /* H: src(3,1) G_bot; V: src(1,2) G_top */
+	/* (3,3) B */ {15, 15},
+};
+
+/*
+ * Smooth-region output: tile sub-block averages as 2×2 RGGB.
+ * Indices into a 4-element {Ravg, GTavg, GBavg, Bavg} array.
+ */
+constexpr uint8_t kSmoothLUT[16] = {
+	0, 1, 0, 1,
+	2, 3, 2, 3,
+	0, 1, 0, 1,
+	2, 3, 2, 3,
+};
+
+constexpr unsigned int N_THREADS = 3;
+
+/*
+ * Smooth-macro threshold (sum of gH+gV, where each gradient is a difference
+ * of two 4-pixel sub-block sums). Empirically: below this, the macro is
+ * locally flat and aliasing from spatial relocation matters more than the
+ * minute detail; emit the sub-block averages instead.
+ *
+ *   pixel range          ≤ 65535
+ *   sub-block sum range  ≤ 4 × 65535 ≈ 2.6e5
+ *   max grad            ≈ 2 × 2.6e5 = 5.2e5
+ * A 4096-code threshold (~ 1.5% of full sub-block-sum range, or 250 codes
+ * per-pixel difference between sub-block averages) marks genuinely flat
+ * regions without bleeding into mild texture.
+ */
+constexpr uint32_t SMOOTH_GRAD_THRESH = 4096;
+
+struct ThreadState {
+	uint32_t hist[PISP_AGC_STATS_NUM_BINS] = {};
+	pisp_awb_statistics_zone zones[PISP_AWB_STATS_NUM_ZONES] = {};
+	uint64_t totalY = 0;
+	uint64_t macroCount = 0;
+};
+
+} /* anonymous namespace */
 
 void QbcRemosaic::process(uint16_t *rawPx, pisp_statistics *st,
 			  unsigned int width, unsigned int height,
 			  unsigned int strideBytes)
 {
+	const unsigned int strideU16 = strideBytes / 2;
+	const unsigned int macroRows = height / 4;
+	const unsigned int macroCols = width / 4;
+
 	/* AWB cell sizing — libpisp finalise_awb() with offset=0. */
 	const unsigned int awbCellW = std::max<unsigned int>(
 		2u, 2u * ((width + PISP_AWB_STATS_SIZE) / (2u * PISP_AWB_STATS_SIZE)));
 	const unsigned int awbCellH = std::max<unsigned int>(
 		2u, 2u * ((height + PISP_AWB_STATS_SIZE) / (2u * PISP_AWB_STATS_SIZE)));
 
-	/* Per-macro scatter into the stats dma-buf would be slow if uncached;
-	 * accumulate locally, memcpy out once at the end. */
-	uint32_t localHist[PISP_AGC_STATS_NUM_BINS] = {};
-	pisp_awb_statistics_zone localZones[PISP_AWB_STATS_NUM_ZONES] = {};
-
-	const unsigned int strideU16 = strideBytes / 2;
-	const unsigned int macroRows = height / 4;
-	const unsigned int macroCols = width / 4;
-	const unsigned int macroPairs = macroCols / 2;
-
-	if (pairCellX_.size() != macroPairs * 2) {
-		pairCellX_.resize(macroPairs * 2);
-		for (unsigned int m = 0; m < macroPairs * 2; m++)
-			pairCellX_[m] = static_cast<uint16_t>(std::min<unsigned int>(
-				(m * 4) / awbCellW, PISP_AWB_STATS_SIZE - 1));
-	}
-
 	/*
-	 * Build the per-macro metering weight LUT once per resolution. Each
-	 * macro (4×4 pixels) maps to a cell in the IPA's metering grid (15×15
-	 * for pisp). Weight 0 means that macro contributes nothing to the
-	 * histogram — matches HW NQ behaviour where w_i = 0 zones are skipped.
+	 * Per-macro metering weight LUT — each 4×4 macro maps to one cell in
+	 * the IPA's metering grid (15×15 for pisp). Built once per resolution.
 	 */
 	if (macroWeight_.size() != macroRows * macroCols &&
 	    meteringGridW_ > 0 && meteringGridH_ > 0) {
@@ -151,182 +279,243 @@ void QbcRemosaic::process(uint16_t *rawPx, pisp_statistics *st,
 		}
 	}
 
-	uint64_t totalY = 0;
-	auto t0 = std::chrono::steady_clock::now();
-
 	/*
-	 * AGC histogram is a Y (luma) histogram with WB gains applied
-	 * (RPi tuning guide §5.9.4 — Pi 5 has access to a proper Y histogram;
-	 * pisp.cpp declares AgcStatsPos::PostWb so the controller does NOT
-	 * undo WB gains). Use the previous-frame ColourGains as a one-frame-late
-	 * approximation; converges with AWB.
-	 *
-	 * Quantize gains to Q10 fixed-point. Clamp to a sane range to bound
-	 * the integer math: max r0s≈4·62320, max gain·Q10≈8·1024, sum fits in u64.
+	 * Post-WB BT.601 Y coefficients baked into Q10, matching HW NQ's
+	 * rgby block (pisp.cpp:1022): Y = R·gR·0.299 + G·gG·0.587 + B·gB·0.114.
 	 */
 	const uint32_t gR_q = static_cast<uint32_t>(
-		std::clamp(wbGainR_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainR_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.299f * 1024.0f);
 	const uint32_t gG_q = static_cast<uint32_t>(
-		std::clamp(wbGainG_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainG_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.587f * 1024.0f);
 	const uint32_t gB_q = static_cast<uint32_t>(
-		std::clamp(wbGainB_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainB_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.114f * 1024.0f);
 
-	constexpr uint16_t BLC = 3200;
-	static const uint8_t kPermBytes[16] = {
-		0,1,  4,5,  2,3,  6,7,
-		8,9,  12,13, 10,11, 14,15,
-	};
-	const uint8x16_t perm = vld1q_u8(kPermBytes);
+	auto t0 = std::chrono::steady_clock::now();
 
-	auto signalBlk = [](uint32_t bsum, unsigned int n) -> uint32_t {
+	/* Live BLC plumbed in from the V4L2 sensor subdev (pisp.cpp). */
+	const uint32_t BLC = blackLevel_.load(std::memory_order_relaxed);
+	auto signalBlk = [BLC](uint32_t bsum, unsigned int n) -> uint32_t {
 		uint32_t nbl = n * BLC;
 		return (bsum > nbl) ? (bsum - nbl) : 0;
 	};
 
-	for (unsigned int mr = 0; mr < macroRows; mr++) {
-		const unsigned int my = mr * 4;
-		uint16_t *row0 = rawPx + my * strideU16;
-		uint16_t *row1 = row0 + strideU16;
-		uint16_t *row2 = row0 + 2 * strideU16;
-		uint16_t *row3 = row0 + 3 * strideU16;
+	auto processStrip = [&](ThreadState &state,
+				unsigned int mrStart, unsigned int mrEnd) {
+		for (unsigned int mr = mrStart; mr < mrEnd; mr++) {
+			const unsigned int my = mr * 4;
+			const unsigned int cellY = std::min<unsigned int>(
+				my / awbCellH, PISP_AWB_STATS_SIZE - 1);
+			uint16_t * const rowBase = rawPx + my * strideU16;
 
-		const unsigned int cellY = std::min<unsigned int>(my / awbCellH,
-								  PISP_AWB_STATS_SIZE - 1);
-		pisp_awb_statistics_zone *zoneRow = &localZones[cellY * PISP_AWB_STATS_SIZE];
+			for (unsigned int mc = 0; mc < macroCols; mc++) {
+				const unsigned int mx = mc * 4;
+				uint16_t * const m = rowBase + mx;
 
-		uint32_t accR = 0, accG = 0, accB = 0, accCount = 0;
-		unsigned int curCellX = 0;
+				/* Load 16 source pixels (4 rows × 4 cols). */
+				uint16_t s[16];
+				for (int r = 0; r < 4; r++) {
+					const uint16_t *rp = m + r * strideU16;
+					s[r * 4 + 0] = rp[0];
+					s[r * 4 + 1] = rp[1];
+					s[r * 4 + 2] = rp[2];
+					s[r * 4 + 3] = rp[3];
+				}
 
-		auto flushAndAdvance = [&](unsigned int newCellX) {
-			if (newCellX != curCellX) {
-				zoneRow[curCellX].R_sum   += accR;
-				zoneRow[curCellX].G_sum   += accG;
-				zoneRow[curCellX].B_sum   += accB;
-				zoneRow[curCellX].counted += accCount;
-				accR = accG = accB = accCount = 0;
-				curCellX = newCellX;
+				/* Sub-block sums (one per 2×2 sub-block of same colour). */
+				uint32_t Rsum  = (uint32_t)s[0]  + s[1]  + s[4]  + s[5];
+				uint32_t Gtsum = (uint32_t)s[2]  + s[3]  + s[6]  + s[7];
+				uint32_t Gbsum = (uint32_t)s[8]  + s[9]  + s[12] + s[13];
+				uint32_t Bsum  = (uint32_t)s[10] + s[11] + s[14] + s[15];
+
+				/* Gradients on sub-block sums (no /4 → just scaled gradient,
+				 * comparison is to a scaled threshold). */
+				int32_t gH = std::abs((int32_t)(Rsum + Gbsum) -
+						      (int32_t)(Gtsum + Bsum));
+				int32_t gV = std::abs((int32_t)(Rsum + Gtsum) -
+						      (int32_t)(Gbsum + Bsum));
+
+				/* Direction-aware blend at every macro — no smooth-mode
+				 * branch. The sub-block-average tile we used in the old
+				 * smooth path produced visible 4×4 quantization blocks in
+				 * flat colour regions (adjacent macros' averages differ
+				 * slightly from sensor noise, so each macro emits a flat
+				 * tile at its own average → eye reads it as posterization).
+				 * The directional blend below naturally handles smooth
+				 * regions: when gH ≈ gV ≈ 0, α ≈ 0.5 and the per-pixel
+				 * noise from both H_src and V_src is preserved, no tile
+				 * boundaries appear.
+				 *
+				 * α ∈ [0, 32768], large = vertical-edge dominant (gH
+				 * dominates) → bias toward V_src so interpolation stays
+				 * on one side of the edge. ε = 1024 stabilises very-low-
+				 * gradient cases (avoids a noise-driven 0/0). */
+				uint16_t out[16];
+				uint64_t total = (uint64_t)gH + (uint64_t)gV + 1024;
+				uint32_t alpha = (uint32_t)
+					(((uint64_t)gH << 15) / total);
+				for (int idx = 0; idx < 16; idx++) {
+					uint16_t hv = s[kRemosaicLUT[idx].h_src];
+					uint16_t vv = s[kRemosaicLUT[idx].v_src];
+					if (hv == vv) {
+						out[idx] = hv;
+					} else {
+						int32_t diff = (int32_t)vv - (int32_t)hv;
+						int32_t blended = (int32_t)hv +
+							(int32_t)(((int64_t)alpha * diff) >> 15);
+						out[idx] = (uint16_t)std::clamp(
+							blended, 0, 65535);
+					}
+				}
+
+				/* Write back 16 output pixels. */
+				for (int r = 0; r < 4; r++) {
+					uint16_t *rp = m + r * strideU16;
+					rp[0] = out[r * 4 + 0];
+					rp[1] = out[r * 4 + 1];
+					rp[2] = out[r * 4 + 2];
+					rp[3] = out[r * 4 + 3];
+				}
+
+				/* Stats: per-macro signal sums (post-BLC) for AWB zones.
+				 * HW NQ averages Gr+Gb into one G per 2×2 cell — match
+				 * by halving the 8-pixel G sum. */
+				uint32_t r4 = signalBlk(Rsum, 4);
+				uint32_t g4 = signalBlk(Gtsum + Gbsum, 8) >> 1;
+				uint32_t b4 = signalBlk(Bsum, 4);
+
+				const unsigned int cellX = std::min<unsigned int>(
+					mx / awbCellW, PISP_AWB_STATS_SIZE - 1);
+				pisp_awb_statistics_zone &z =
+					state.zones[cellY * PISP_AWB_STATS_SIZE + cellX];
+				z.R_sum   += r4;
+				z.G_sum   += g4;
+				z.B_sum   += b4;
+				z.counted += 4;
+
+				/*
+				 * Post-WB BT.601 Y *per pixel* for the AGC histogram and
+				 * Y_sum, matching HW NQ semantics: each of the 16 source
+				 * pixels contributes one bin entry. Earlier per-macro
+				 * version (1 Y from sub-block averages, weight 16) hid
+				 * highlight pixels in the macro's mean → AGC saturation-
+				 * aware gain projection under-estimated the saturation
+				 * risk and over-exposed (visible as magenta cast on near-
+				 * white highlights at higher CCTs).
+				 *
+				 * For each pixel, Y is computed using its actual raw value
+				 * for its sampled colour plus the local sub-block averages
+				 * for the other two colours (closest available estimate at
+				 * the pixel's spatial position). Per-pixel averages:
+				 *   R_avg, GT_avg, GB_avg, B_avg  (post-BLC, /4)
+				 *   G_avg = (GT_avg + GB_avg) / 2 used at R/B positions
+				 * Pre-compute the 3 "background" terms (the constant
+				 * contribution from the two non-sampled colours per macro)
+				 * so the inner loop is one multiply + one add per pixel.
+				 */
+				uint32_t Ravg  = r4;       /* already 4-pixel sum post-BLC */
+				uint32_t GTavg = signalBlk(Gtsum, 4);
+				uint32_t GBavg = signalBlk(Gbsum, 4);
+				uint32_t Bavg  = b4;
+				Ravg >>= 2; GTavg >>= 2; GBavg >>= 2; Bavg >>= 2;
+				uint32_t Gavg  = (GTavg + GBavg) >> 1;
+
+				/* bg_R = G_avg*gG_q + B_avg*gB_q (for R-position pixels) */
+				uint64_t bg_R = (uint64_t)Gavg  * gG_q +
+						(uint64_t)Bavg  * gB_q;
+				/* bg_G = R_avg*gR_q + B_avg*gB_q (for G-position pixels) */
+				uint64_t bg_G = (uint64_t)Ravg  * gR_q +
+						(uint64_t)Bavg  * gB_q;
+				/* bg_B = R_avg*gR_q + G_avg*gG_q (for B-position pixels) */
+				uint64_t bg_B = (uint64_t)Ravg  * gR_q +
+						(uint64_t)Gavg  * gG_q;
+
+				const unsigned int w = macroWeight_.empty()
+					? 1u
+					: macroWeight_[mr * macroCols + mc];
+
+				/*
+				 * QBC pixel-colour map (idx = row*4+col):
+				 *   row 0-1 col 0-1 → R   (idx 0,1,4,5)
+				 *   row 0-1 col 2-3 → Gt  (idx 2,3,6,7)
+				 *   row 2-3 col 0-1 → Gb  (idx 8,9,12,13)
+				 *   row 2-3 col 2-3 → B   (idx 10,11,14,15)
+				 * Iterate by colour group so each block uses one bg term.
+				 */
+				static const uint8_t kRpos[4]  = { 0,  1,  4,  5};
+				static const uint8_t kGtpos[4] = { 2,  3,  6,  7};
+				static const uint8_t kGbpos[4] = { 8,  9, 12, 13};
+				static const uint8_t kBpos[4]  = {10, 11, 14, 15};
+
+				auto addPx = [&](uint32_t v_signal, uint32_t coef,
+						 uint64_t bg) {
+					uint64_t y_q = (uint64_t)v_signal * coef + bg;
+					uint32_t y = (uint32_t)(y_q >> 10);
+					if (y > 65535)
+						y = 65535;
+					state.hist[y >> 6] += w;
+					state.totalY += y;
+				};
+				for (int i = 0; i < 4; i++) {
+					uint16_t pv = s[kRpos[i]];
+					uint32_t sig = pv > BLC ? pv - BLC : 0;
+					addPx(sig, gR_q, bg_R);
+				}
+				for (int i = 0; i < 4; i++) {
+					uint16_t pv = s[kGtpos[i]];
+					uint32_t sig = pv > BLC ? pv - BLC : 0;
+					addPx(sig, gG_q, bg_G);
+				}
+				for (int i = 0; i < 4; i++) {
+					uint16_t pv = s[kGbpos[i]];
+					uint32_t sig = pv > BLC ? pv - BLC : 0;
+					addPx(sig, gG_q, bg_G);
+				}
+				for (int i = 0; i < 4; i++) {
+					uint16_t pv = s[kBpos[i]];
+					uint32_t sig = pv > BLC ? pv - BLC : 0;
+					addPx(sig, gB_q, bg_B);
+				}
+				state.macroCount += 16;
 			}
-		};
-
-		/*
-		 * NEON inner loop: 2 macros (8 cols) per iteration.
-		 *
-		 * Source layout per macro (RGGB-quadbayer):
-		 *   [R R G G]   ← row0
-		 *   [R R G G]   ← row1
-		 *   [G G B B]   ← row2
-		 *   [G G B B]   ← row3
-		 *
-		 * Per row, the source 8-lane vector is
-		 *   [m0c0 m0c1 m0c2 m0c3 m1c0 m1c1 m1c2 m1c3]
-		 * Intra-group swap permutation [0,2,1,3,4,6,5,7] turns each row into
-		 * a standard 2x2-RGGB row pattern (RGRG / GBGB tiled).
-		 *
-		 * Output row order is also swapped: src row 1 ↔ src row 2 (so the
-		 * full 4x4 output is RGGB-tiled, not GBGB-RGRG-tiled).
-		 *
-		 * Each source pixel maps to a unique output position (no averaging),
-		 * preserving sub-block resolution that block-average would destroy.
-		 */
-		for (unsigned int p = 0; p < macroPairs; p++) {
-			const unsigned int mx = p * 8;
-
-			uint16x8_t v0 = vld1q_u16(row0 + mx);
-			uint16x8_t v1 = vld1q_u16(row1 + mx);
-			uint16x8_t v2 = vld1q_u16(row2 + mx);
-			uint16x8_t v3 = vld1q_u16(row3 + mx);
-
-			/*
-			 * Block sums (sum of 4 pixels per 2x2 block) computed in u32
-			 * to survive 16-bit-shifted values that would overflow a u16
-			 * row-sum (max 4 * 65520 = 262080).
-			 */
-			uint32x4_t v0pair = vpaddlq_u16(v0);
-			uint32x4_t v1pair = vpaddlq_u16(v1);
-			uint32x4_t v2pair = vpaddlq_u16(v2);
-			uint32x4_t v3pair = vpaddlq_u16(v3);
-			uint32x4_t topPairs = vaddq_u32(v0pair, v1pair);
-			uint32x4_t botPairs = vaddq_u32(v2pair, v3pair);
-			/* topPairs = [R_m0, Gtop_m0, R_m1, Gtop_m1]
-			 * botPairs = [Gbot_m0, B_m0, Gbot_m1, B_m1] */
-
-			/* Permute (intra-group swap RRGG → RGRG) and write back. */
-			uint16x8_t v0p = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v0), perm));
-			uint16x8_t v1p = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v1), perm));
-			uint16x8_t v2p = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v2), perm));
-			uint16x8_t v3p = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v3), perm));
-
-			vst1q_u16(row0 + mx, v0p);
-			vst1q_u16(row1 + mx, v2p);  /* src row 2 → out row 1 */
-			vst1q_u16(row2 + mx, v1p);  /* src row 1 → out row 2 */
-			vst1q_u16(row3 + mx, v3p);
-
-			/* AWB block sums (raw, post-BLC). */
-			uint32_t lanes[8];
-			vst1q_u32(lanes,     topPairs);
-			vst1q_u32(lanes + 4, botPairs);
-
-			/* Per macro: R signal sum = signal_per_pixel × 4 pixels.
-			 * G signal sum (halved) = signal_per_pixel × 4 pixels (since
-			 * G has 8 pixels per macro, halving gives 4 G_avg samples
-			 * matching HW NQ's per-cell-G counting). B signal × 4 pixels.
-			 * accCount += 4 (one count per binned-cell-equivalent). */
-			uint32_t r0s = signalBlk(lanes[0], 4);
-			uint32_t g0s = signalBlk(lanes[1] + lanes[4], 8) >> 1;
-			uint32_t b0s = signalBlk(lanes[5], 4);
-			uint32_t r1s = signalBlk(lanes[2], 4);
-			uint32_t g1s = signalBlk(lanes[3] + lanes[6], 8) >> 1;
-			uint32_t b1s = signalBlk(lanes[7], 4);
-
-			/*
-			 * Per-cell post-WB BT.601 luma for the AGC histogram.
-			 * r0s/g0s/b0s are post-BLC signal sums of 4 same-channel
-			 * pixels per macro (so each is 4× the per-pixel value).
-			 * With gains in Q10:
-			 *   Y_pixel = (R·gR + 2·G·gG + B·gB) / 4
-			 *           = (r·gR + 2·g·gG + b·gB) / 16
-			 * Including the Q10 un-quantize, divide by 16 · 1024 = 2^14.
-			 */
-			auto yBin = [&](uint32_t r, uint32_t g, uint32_t b) -> unsigned int {
-				uint64_t y_q = uint64_t(r) * gR_q
-					     + 2ull * uint64_t(g) * gG_q
-					     + uint64_t(b) * gB_q;
-				uint32_t y = static_cast<uint32_t>(y_q >> 14);
-				if (y > 65535) y = 65535;
-				return y >> 6;
-			};
-			/* Per-pixel count weighted by metering w_i (RPi tuning guide
-			 * §5.9.4: Pi 5 counts each pixel w_i times). Falls back to
-			 * uniform w=1 when the weights table didn't load. */
-			unsigned int macroIdx0 = mr * macroCols + 2 * p;
-			unsigned int macroIdx1 = macroIdx0 + 1;
-			unsigned int w0 = macroWeight_.empty() ? 1 : macroWeight_[macroIdx0];
-			unsigned int w1 = macroWeight_.empty() ? 1 : macroWeight_[macroIdx1];
-			localHist[yBin(r0s, g0s, b0s)] += 16 * w0;
-			localHist[yBin(r1s, g1s, b1s)] += 16 * w1;
-
-			flushAndAdvance(pairCellX_[2 * p]);
-			accR += r0s; accG += g0s; accB += b0s; accCount += 4;
-			totalY += (r0s + 2 * g0s + b0s) >> 4;
-
-			flushAndAdvance(pairCellX_[2 * p + 1]);
-			accR += r1s; accG += g1s; accB += b1s; accCount += 4;
-			totalY += (r1s + 2 * g1s + b1s) >> 4;
 		}
+	};
 
-		zoneRow[curCellX].R_sum   += accR;
-		zoneRow[curCellX].G_sum   += accG;
-		zoneRow[curCellX].B_sum   += accB;
-		zoneRow[curCellX].counted += accCount;
+	ThreadState states[N_THREADS];
+	std::thread workers[N_THREADS];
+	const unsigned int rowsPerThread =
+		(macroRows + N_THREADS - 1) / N_THREADS;
+
+	for (unsigned int t = 0; t < N_THREADS; t++) {
+		unsigned int mrStart = t * rowsPerThread;
+		unsigned int mrEnd = std::min(mrStart + rowsPerThread, macroRows);
+		if (mrStart >= mrEnd)
+			continue;
+		workers[t] = std::thread(processStrip,
+					 std::ref(states[t]), mrStart, mrEnd);
+	}
+	for (auto &th : workers) {
+		if (th.joinable())
+			th.join();
 	}
 
-	/* IPA reads all of agc.floating[1..3] + cdaf.foms[] too — zero everything
-	 * before writing the fields we use. lux.cpp divides counted; must be nonzero. */
+	/* Merge per-thread stats into the output. */
 	memset(st, 0, sizeof(*st));
-	memcpy(st->awb.zones, localZones, sizeof(localZones));
-	memcpy(st->agc.histogram, localHist, sizeof(localHist));
+	uint64_t totalY = 0;
+	uint64_t macroCount = 0;
+	for (unsigned int t = 0; t < N_THREADS; t++) {
+		for (unsigned int i = 0; i < PISP_AGC_STATS_NUM_BINS; i++)
+			st->agc.histogram[i] += states[t].hist[i];
+		for (unsigned int i = 0; i < PISP_AWB_STATS_NUM_ZONES; i++) {
+			st->awb.zones[i].R_sum   += states[t].zones[i].R_sum;
+			st->awb.zones[i].G_sum   += states[t].zones[i].G_sum;
+			st->awb.zones[i].B_sum   += states[t].zones[i].B_sum;
+			st->awb.zones[i].counted += states[t].zones[i].counted;
+		}
+		totalY += states[t].totalY;
+		macroCount += states[t].macroCount;
+	}
 	st->agc.floating[0].Y_sum = totalY;
-	st->agc.floating[0].counted = macroRows * macroCols;
+	st->agc.floating[0].counted = macroCount;
 
 	LOG(RPI, Debug) << "QBC " << width << "x" << height << " "
 		<< std::chrono::duration_cast<std::chrono::microseconds>(

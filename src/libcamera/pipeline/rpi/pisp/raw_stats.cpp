@@ -85,6 +85,33 @@ void RawStatsProducer::loadMeteringWeights(const std::string &sensorModel)
 	meteringGridW_ = meteringGridH_ = side;
 }
 
+uint16_t RawStatsProducer::loadBlackLevel(const std::string &sensorModel)
+{
+	const std::string tuningPath =
+		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
+	File f(tuningPath);
+	if (!f.open(File::OpenModeFlag::ReadOnly))
+		return 0;
+	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
+	if (!root)
+		return 0;
+	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
+		const YamlObject &bl = entry["rpi.black_level"];
+		if (!bl.isDictionary())
+			continue;
+		uint16_t v = bl["black_level"].get<uint16_t>(0);
+		if (v != 0)
+			blackLevel_.store(v, std::memory_order_relaxed);
+		return v;
+	}
+	return 0;
+}
+
+void RawStatsProducer::setBlackLevel(uint16_t blc)
+{
+	blackLevel_.store(blc, std::memory_order_relaxed);
+}
+
 void RawStatsProducer::updateWbGains(const ControlList &metadata)
 {
 	const auto &gains = metadata.get(controls::ColourGains);
@@ -130,23 +157,28 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 	uint64_t totalY = 0;
 	auto t0 = std::chrono::steady_clock::now();
 
+	/*
+	 * Post-WB BT.601 Y coefficients baked into Q10 WB gains, matching the
+	 * HW NQ rgby block (pisp.cpp:1022). Y = R·gR·0.299 + G·gG·0.587 +
+	 * B·gB·0.114; coefficients sum to 1.0 so a white pixel at unity gain
+	 * gives Y = v with no extra /4 normalization.
+	 */
 	const uint32_t gR_q = static_cast<uint32_t>(
-		std::clamp(wbGainR_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainR_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.299f * 1024.0f);
 	const uint32_t gG_q = static_cast<uint32_t>(
-		std::clamp(wbGainG_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainG_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.587f * 1024.0f);
 	const uint32_t gB_q = static_cast<uint32_t>(
-		std::clamp(wbGainB_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 1024.0f);
+		std::clamp(wbGainB_.load(std::memory_order_relaxed), 0.25f, 8.0f) * 0.114f * 1024.0f);
 
 	/*
-	 * BLC: at higher bit depths the sensor reports a wider raw value but
-	 * the pedestal stays at the same physical level. The IPA tuning's
-	 * black_level entry is in 16-bit-shifted units; with libcamera's CFE
-	 * unpack we always see left-justified samples in u16 lanes, so BLC=3200
-	 * (= 200 in 12-bit raw, ×16) lines up regardless of native depth.
+	 * BLC: live value plumbed from the V4L2 sensor subdev (see pisp.cpp
+	 * cfeBufferDequeue → setBlackLevel). 16-bit-shifted pixel-units so it
+	 * lines up with libcamera's left-justified u16 CFE samples regardless
+	 * of native bit depth.
 	 */
-	constexpr uint16_t BLC = 3200;
+	const uint32_t BLC = blackLevel_.load(std::memory_order_relaxed);
 
-	auto signalBlk = [](uint32_t bsum, unsigned int n) -> uint32_t {
+	auto signalBlk = [BLC](uint32_t bsum, unsigned int n) -> uint32_t {
 		uint32_t nbl = n * BLC;
 		return (bsum > nbl) ? (bsum - nbl) : 0;
 	};
@@ -193,16 +225,16 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			uint32_t b_sum_4 = vaddvq_u32(b_odds);
 
 			uint32_t rSig = signalBlk(r_sum_4, 4);
-			uint32_t gSig = signalBlk(g_sum_8, 8) >> 1;  /* halve to match
-									 * per-pixel scale */
+			uint32_t gSig = signalBlk(g_sum_8, 8) >> 1;  /* halve to
+								      * match HW NQ
+								      * G-per-cell */
 			uint32_t bSig = signalBlk(b_sum_4, 4);
 
-			/* Each cell-pair (4 RGGB cells) belongs to one AWB zone
-			 * (cells in a row are striped by awbCellW pixels). Walk
-			 * by AWB-cell-X. */
-			unsigned int xPair = x0 * 2;  /* pair in pixel coords */
+			/* Each cell-pair (4 RGGB cells = 8 source columns)
+			 * belongs to one AWB zone. x0 = p*8 is already the
+			 * pixel-column index of the cell-pair start. */
 			unsigned int cellX = std::min<unsigned int>(
-				xPair / awbCellW, PISP_AWB_STATS_SIZE - 1);
+				x0 / awbCellW, PISP_AWB_STATS_SIZE - 1);
 			flushAndAdvance(cellX);
 
 			accR += rSig;
@@ -210,11 +242,14 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			accB += bSig;
 			accCount += 4;
 
-			/* AGC histogram — one Y per cell-pair, weighted by w_i. */
+			/* AGC histogram — one BT.601 Y per cell-pair (= 4 RGGB
+			 * cells). rSig/gSig/bSig are per-pixel × 4 (block sum
+			 * of 4 cells); shift >> 12 (= /(4·1024)) gives per-pixel
+			 * Y at 16-bit scale. */
 			uint64_t y_q = uint64_t(rSig) * gR_q
-				     + 2ull * uint64_t(gSig) * gG_q
+				     + uint64_t(gSig) * gG_q
 				     + uint64_t(bSig) * gB_q;
-			uint32_t y = static_cast<uint32_t>(y_q >> 14);
+			uint32_t y = static_cast<uint32_t>(y_q >> 12);
 			if (y > 65535)
 				y = 65535;
 			unsigned int bin = y >> 6;
@@ -231,7 +266,7 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 				  + (unsigned int)cellWeight_[base + 3];
 			}
 			localHist[bin] += 4 * w;
-			totalY += (rSig + 2 * gSig + bSig) >> 4;
+			totalY += y;
 		}
 
 		zoneRow[curCellX].R_sum   += accR;
