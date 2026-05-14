@@ -52,8 +52,17 @@ bool CcmpUnwrap::setParams(const Params &p)
 	 */
 	const uint32_t T1 = std::min<uint32_t>(p.thresh1, 0x1FFFFu);
 	const uint32_t T2 = std::min<uint32_t>(std::max<uint32_t>(p.thresh2, T1), 0x1FFFFu);
-	const unsigned int sL = std::min<unsigned int>(p.slope_l_idx, 11);
-	const unsigned int sH = std::min<unsigned int>(p.slope_h_idx, 11);
+	/*
+	 * Empirically the IMX585 implements register value `idx` as forward
+	 * slope 2^-(idx+1), not 2^-idx as the AppNote table suggests. Verified
+	 * by capturing matched HDR-16 (linear) + HDR-12 (CCMP) frames at four
+	 * LED levels and fitting the slope: register 0x02 produces a forward
+	 * 1/8 compression (inverse ×8 = 2^3), not the AppNote-listed 1/4.
+	 * Apply the (idx+1) shift here so the inverse curve actually matches
+	 * the hardware.
+	 */
+	const unsigned int sL = std::min<unsigned int>(p.slope_l_idx + 1, 12);
+	const unsigned int sH = std::min<unsigned int>(p.slope_h_idx + 1, 12);
 	const uint32_t O2 = T1 + ((T2 - T1) >> sL);
 	const int32_t blc_u12 = std::min<uint32_t>(p.blc_u12, 4095);
 	const int32_t blc_u16 = blc_u12 << 4;
