@@ -11,6 +11,7 @@
 #include "ccmp_unwrap.h"
 
 #include <algorithm>
+#include <arm_neon.h>
 
 #include <libcamera/base/log.h>
 
@@ -97,17 +98,30 @@ bool CcmpUnwrap::setParams(const Params &p)
 	 * the BLC pedestal that the sensor adds at the very end. The buffer
 	 * pixel `out` carries that pedestal (BLC_u12 ≈ 200 for IMX585), so
 	 * we must subtract it BEFORE looking up the inverse, then add the
-	 * IPA's expected u16 BLC to the result so the final value lands in
-	 * the same domain as the 16-bit ClearHDR linear path.
+	 * IPA's expected u16 BLC to the result.
 	 *
-	 * Verified empirically (LED 5500K@80%, ET=4991us, AG=1, per-pixel
-	 * binning of matched HDR-16 vs HDR-12 captures): this formula matches
-	 * the HDR-16 linear values within ~5% across the full u12 range.
+	 * Output stretch: the natural inverse maxes at ~28000 (u16) for
+	 * u12=4095, well below the BE's expected 12-bit-left-justified u16
+	 * range of (BLC..65520). The BE applies its tone-mapping/gamma
+	 * assuming the input fills that range, so an unwrapped buffer that
+	 * tops at 28000 renders as if it's a dim 12-bit capture — bright
+	 * pixels (which CCMP saturates at u12=4095) end up in the lower
+	 * half of u16 and the BE crushes them, producing a magenta cast in
+	 * highlights as a side-effect of per-channel saturation imbalance.
+	 *
+	 * Stretch the post-BLC range linearly so LUT[4095] lands at 0xFFF0
+	 * (matching the 12-bit-left-justified max). This preserves the
+	 * curve's relative shape while putting bright pixels at u16 values
+	 * the BE knows how to tone-map.
 	 */
+	const uint32_t natural_max_postblc =
+		(inverse(4095u - blc_u12) > 0) ? inverse(4095u - blc_u12) : 1u;
+	const uint32_t target_max_postblc = 0xFFF0u - blc_u16;
 	for (uint32_t out = 0; out < 4096; out++) {
 		int32_t out_post_blc = static_cast<int32_t>(out) - blc_u12;
-		uint32_t in = (out_post_blc <= 0) ? 0u : inverse(static_cast<uint32_t>(out_post_blc));
-		int64_t val = static_cast<int64_t>(blc_u16) + static_cast<int64_t>(in);
+		uint64_t in = (out_post_blc <= 0) ? 0u : inverse(static_cast<uint32_t>(out_post_blc));
+		uint64_t scaled = (in * target_max_postblc) / natural_max_postblc;
+		int64_t val = static_cast<int64_t>(blc_u16) + static_cast<int64_t>(scaled);
 		if (val < 0)
 			val = 0;
 		if (val > 0xFFFF)
@@ -124,6 +138,29 @@ bool CcmpUnwrap::setParams(const Params &p)
 		<< " LUT[500]=" << lut_[500]
 		<< " LUT[2048]=" << lut_[2048] << " LUT[4095]=" << lut_[4095];
 	return true;
+}
+
+void CcmpUnwrap::process(uint16_t *buf, size_t pixels)
+{
+	std::lock_guard<std::mutex> lk(lutMutex_);
+	if (!paramsValid_)
+		return;
+	/*
+	 * Inner loop: load 8 u16s, look each up in the LUT, store back.
+	 * The 4096-entry LUT is too large for vqtbl gather, so the lookup
+	 * itself stays scalar; NEON keeps the load/store wide.
+	 */
+	size_t i = 0;
+	for (; i + 8 <= pixels; i += 8) {
+		uint16x8_t v = vld1q_u16(buf + i);
+		uint16_t a[8];
+		vst1q_u16(a, v);
+		for (int k = 0; k < 8; k++)
+			a[k] = lut_[(a[k] >> 4) & 0xFFFu];
+		vst1q_u16(buf + i, vld1q_u16(a));
+	}
+	for (; i < pixels; i++)
+		buf[i] = lut_[(buf[i] >> 4) & 0xFFFu];
 }
 
 } /* namespace libcamera */

@@ -1645,7 +1645,8 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 			<< sensor_->model();
 		rawStats_ = std::make_unique<RawStatsProducer>();
 		rawStats_->loadMeteringWeights(sensor_->model());
-		rawStats_->setLinearizationLut(ccmpUnwrap_->lut());
+		/* No LUT install needed — processRawStats() unwraps the buffer
+		 * in place before the stats kernel reads it. */
 	}
 	if (qbc_ || ccmpUnwrap_ || wdrActive) {
 		LOG(RPI, Info) << (qbc_           ? "QBC remosaic"
@@ -2809,7 +2810,7 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 	unsigned int stride = cfg.stride;
 	ASSERT(stride >= width * 2u);
 
-	const uint16_t *rawPx = reinterpret_cast<const uint16_t *>(rawBuf.mapped->planes()[0].data());
+	uint16_t *rawPx = reinterpret_cast<uint16_t *>(rawBuf.mapped->planes()[0].data());
 	pisp_statistics *st = reinterpret_cast<pisp_statistics *>(statsBuf.mapped->planes()[0].data());
 
 	updateSensorBlackLevel();
@@ -2818,11 +2819,20 @@ void PiSPCameraData::processRawStats(FrameBuffer *raw, FrameBuffer *stats)
 	dmabufSyncStart(stats->planes()[0].fd);
 
 	/*
-	 * No buffer rewrite. When CCMP is active the LUT was installed into
-	 * RawStatsProducer at configure time (see initCcmpUnwrap), and the
-	 * stats kernel applies it per pixel during accumulation — IPA sees
-	 * linearised stats, BE consumes the unmodified compressed buffer.
+	 * If we're on the IMX585 12-bit ClearHDR (CCMP) path, unwrap the
+	 * gradation curve in place on the raw buffer so both BE rendering AND
+	 * the stats kernel see the same 16-bit-linear data the sensor would
+	 * deliver natively in 16-bit ClearHDR mode. This is the cleanest place
+	 * to do it — the buffer is mapped, the BE hasn't touched it yet, and
+	 * the stats producer below will read the unwrapped values without
+	 * needing any LUT-aware path of its own.
 	 */
+	if (ccmpUnwrap_) {
+		const unsigned int strideU16 = stride / 2;
+		for (unsigned int y = 0; y < height; y++)
+			ccmpUnwrap_->process(rawPx + y * strideU16, width);
+	}
+
 	rawStats_->process(rawPx, st, width, height, stride);
 
 	dmabufSyncEnd(stats->planes()[0].fd);

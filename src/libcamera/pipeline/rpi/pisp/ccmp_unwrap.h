@@ -78,19 +78,22 @@ public:
 	bool setParams(const Params &p);
 
 	/*
-	 * LUT pointer for the stats kernel. 4096 u16 entries indexed by the
-	 * compressed pixel value (pixel_u16 >> 4); each entry is the
-	 * linearised, BLC-anchored u16 representation. Hand this directly to
-	 * RawStatsProducer::setLinearizationLut().
-	 *
-	 * The pointer stays valid for the lifetime of the CcmpUnwrap instance,
-	 * but the contents may be rebuilt asynchronously when setParams() is
-	 * called. Readers (i.e. the stats kernel inner loop) should treat the
-	 * entries as immutable for the duration of one stats pass — a
-	 * mid-pass rebuild would only cause a transient inconsistency in a
-	 * single frame's stats, not a crash.
+	 * LUT pointer (4096 u16 entries indexed by `pixel_u16 >> 4`). Kept for
+	 * any consumer that wants to apply linearisation outside this class —
+	 * but the canonical use is process() below, which rewrites the buffer
+	 * in place so both BE and the stats kernel see linear data.
 	 */
 	const uint16_t *lut() const { return lut_; }
+
+	/*
+	 * Apply the inverse-CCMP LUT in place to each u16 pixel of `buf`.
+	 * After this, the buffer holds the same linear u16 values that the
+	 * sensor's 16-bit ClearHDR mode would deliver natively, so the BE
+	 * renders correctly without any further changes and the stats kernel
+	 * processes the buffer the same way it processes 14/16-bit unpacked
+	 * data. NEON-vectorised across 8 pixels per inner iteration.
+	 */
+	void process(uint16_t *buf, size_t pixels);
 
 	const Params &params() const { return params_; }
 
