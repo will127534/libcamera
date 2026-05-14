@@ -53,16 +53,12 @@ bool CcmpUnwrap::setParams(const Params &p)
 	const uint32_t T1 = std::min<uint32_t>(p.thresh1, 0x1FFFFu);
 	const uint32_t T2 = std::min<uint32_t>(std::max<uint32_t>(p.thresh2, T1), 0x1FFFFu);
 	/*
-	 * Empirically the IMX585 implements register value `idx` as forward
-	 * slope 2^-(idx+1), not 2^-idx as the AppNote table suggests. Verified
-	 * by capturing matched HDR-16 (linear) + HDR-12 (CCMP) frames at four
-	 * LED levels and fitting the slope: register 0x02 produces a forward
-	 * 1/8 compression (inverse ×8 = 2^3), not the AppNote-listed 1/4.
-	 * Apply the (idx+1) shift here so the inverse curve actually matches
-	 * the hardware.
+	 * Per IMX585 AppNote §4.3 register table, ACMP slope register `idx`
+	 * implements forward compression 2^-idx (so inverse multiplier 2^idx).
+	 * The earlier (idx+1) "fix" was masking a different bug — see below.
 	 */
-	const unsigned int sL = std::min<unsigned int>(p.slope_l_idx + 1, 12);
-	const unsigned int sH = std::min<unsigned int>(p.slope_h_idx + 1, 12);
+	const unsigned int sL = std::min<unsigned int>(p.slope_l_idx, 11);
+	const unsigned int sH = std::min<unsigned int>(p.slope_h_idx, 11);
 	const uint32_t O2 = T1 + ((T2 - T1) >> sL);
 	const int32_t blc_u12 = std::min<uint32_t>(p.blc_u12, 4095);
 	const int32_t blc_u16 = blc_u12 << 4;
@@ -95,10 +91,23 @@ bool CcmpUnwrap::setParams(const Params &p)
 	 * scene + exposure, Lux readings within ~5% (28000 vs 31000 in our
 	 * LED 5500K test), vs ~9× over-report with a stacked `<< 4` rescale.
 	 */
+	/*
+	 * The CCMP curve operates in the sensor's pre-pedestal coordinate
+	 * space — so the input to inverse() is the post-CCMP value WITHOUT
+	 * the BLC pedestal that the sensor adds at the very end. The buffer
+	 * pixel `out` carries that pedestal (BLC_u12 ≈ 200 for IMX585), so
+	 * we must subtract it BEFORE looking up the inverse, then add the
+	 * IPA's expected u16 BLC to the result so the final value lands in
+	 * the same domain as the 16-bit ClearHDR linear path.
+	 *
+	 * Verified empirically (LED 5500K@80%, ET=4991us, AG=1, per-pixel
+	 * binning of matched HDR-16 vs HDR-12 captures): this formula matches
+	 * the HDR-16 linear values within ~5% across the full u12 range.
+	 */
 	for (uint32_t out = 0; out < 4096; out++) {
-		int64_t in = static_cast<int64_t>(inverse(out));
-		int64_t val = static_cast<int64_t>(blc_u16) +
-			      (in - static_cast<int64_t>(blc_u12));
+		int32_t out_post_blc = static_cast<int32_t>(out) - blc_u12;
+		uint32_t in = (out_post_blc <= 0) ? 0u : inverse(static_cast<uint32_t>(out_post_blc));
+		int64_t val = static_cast<int64_t>(blc_u16) + static_cast<int64_t>(in);
 		if (val < 0)
 			val = 0;
 		if (val > 0xFFFF)
