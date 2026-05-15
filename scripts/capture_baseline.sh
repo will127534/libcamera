@@ -51,9 +51,18 @@ TIMEOUT_AUTO_MS=${TIMEOUT_AUTO_MS:-15000}    # auto-mode: AGC/AWB convergence
 TIMEOUT_MANUAL_MS=${TIMEOUT_MANUAL_MS:-4000} # manual: no convergence needed
 LIBCAMERA_LOG_LEVELS=${LIBCAMERA_LOG_LEVELS:-RPiAwb:1,RPiAgc:1,RPI:0}
 
-LED_PY=/home/pi/bluetooth_light_control/weeylite.py
-BLUEZ_SH=/home/pi/bluetooth_light_control/bluez-control.sh
+LED_PY=${LED_PY:-/home/pi/bluetooth_light_control/weeylite.py}
+BLUEZ_SH=${BLUEZ_SH:-/home/pi/bluetooth_light_control/bluez-control.sh}
 WEEYLITE_OPTS=(env WEEYLITE_CHANNEL=2 WEEYLITE_GROUP=A python3 "$LED_PY")
+
+# LED control is optional — set WEEYLITE_DISABLE=1 to skip, or just point
+# LED_PY/BLUEZ_SH at non-existent paths. Useful when running on a different
+# rig or when the user wants to control lighting manually.
+LED_ENABLED=1
+if [ "${WEEYLITE_DISABLE:-0}" = "1" ] || [ ! -x "$LED_PY" ] || [ ! -x "$BLUEZ_SH" ]; then
+    LED_ENABLED=0
+    echo "LED control disabled (WEEYLITE_DISABLE=1 or scripts missing)"
+fi
 
 mkdir -p "$OUT"
 
@@ -69,18 +78,20 @@ imx585_subdev() {
 }
 
 cleanup() {
-    sudo "$BLUEZ_SH" start 2>/dev/null || true
+    [ "$LED_ENABLED" = "1" ] && sudo "$BLUEZ_SH" start 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # --- LED setup ---
-sudo "$BLUEZ_SH" stop >/dev/null 2>&1 || true
-sleep 1
-"${WEEYLITE_OPTS[@]}" on >/dev/null 2>&1 || true
-sleep 1
-"${WEEYLITE_OPTS[@]}" cct "$CCT" "$POWER" >/dev/null 2>&1 || true
-sleep 2
-echo "LED set: CCT=${CCT}K POWER=${POWER}%"
+if [ "$LED_ENABLED" = "1" ]; then
+    sudo "$BLUEZ_SH" stop >/dev/null 2>&1 || true
+    sleep 1
+    "${WEEYLITE_OPTS[@]}" on >/dev/null 2>&1 || true
+    sleep 1
+    "${WEEYLITE_OPTS[@]}" cct "$CCT" "$POWER" >/dev/null 2>&1 || true
+    sleep 2
+    echo "LED set: CCT=${CCT}K POWER=${POWER}%"
+fi
 
 SUBDEV585=$(imx585_subdev) || { echo "IMX585 subdev not found"; exit 1; }
 echo "IMX585 subdev: $SUBDEV585"
