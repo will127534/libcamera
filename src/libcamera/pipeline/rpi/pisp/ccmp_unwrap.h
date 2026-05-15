@@ -40,10 +40,8 @@
  *     than the compressed mid-band (which would tell AGC to keep exposing).
  *
  * Engaged from the pisp pipeline handler when wide_dynamic_range = 1 on an
- * IMX585 12-bit sensor format. The CcmpUnwrap object builds the LUT and
- * the pipeline handler hands its `lut()` pointer to RawStatsProducer's
- * `setLinearizationLut()`. From then on RawStatsProducer applies LUT[u12]
- * per pixel during accumulation.
+ * IMX585 12-bit sensor format. process() applies the LUT in place to the
+ * raw buffer so both BE and the SW stats kernel consume linear-domain data.
  */
 
 #pragma once
@@ -76,14 +74,6 @@ public:
 	 * changed.
 	 */
 	bool setParams(const Params &p);
-
-	/*
-	 * LUT pointer (4096 u16 entries indexed by `pixel_u16 >> 4`). Kept for
-	 * any consumer that wants to apply linearisation outside this class —
-	 * but the canonical use is process() below, which rewrites the buffer
-	 * in place so both BE and the stats kernel see linear data.
-	 */
-	const uint16_t *lut() const { return lut_; }
 
 	/*
 	 * Apply the inverse-CCMP LUT in place to each u16 pixel of `buf`.

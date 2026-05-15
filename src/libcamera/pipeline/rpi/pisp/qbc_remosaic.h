@@ -90,10 +90,6 @@ public:
 		     unsigned int width, unsigned int height,
 		     unsigned int strideBytes);
 
-	/* Path of the last stats dump file written (for diagnostics). */
-	const std::string &lastDumpFile() const { return lastDumpFile_; }
-	void setLastDumpFile(std::string s) { lastDumpFile_ = std::move(s); }
-
 private:
 	/* AWB gains plumbed from the IPA, one frame behind. */
 	std::atomic<float> wbGainR_{ 1.0f };
@@ -115,8 +111,6 @@ private:
 	unsigned int meteringGridW_ = 0;
 	unsigned int meteringGridH_ = 0;
 	std::vector<uint8_t> macroWeight_;        /* per-macro weight cache */
-
-	std::string lastDumpFile_;
 };
 
 } /* namespace libcamera */

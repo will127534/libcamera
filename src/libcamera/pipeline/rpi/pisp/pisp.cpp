@@ -1600,7 +1600,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	 */
 	bool wdrActive = false;
 	if (sensor_->model() == "imx585") {
-		constexpr uint32_t kCidWdr = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
+		constexpr uint32_t kCidWdr = V4L2_CID_WIDE_DYNAMIC_RANGE;
 		if (sensor_->controls().find(kCidWdr) != sensor_->controls().end()) {
 			const uint32_t cids[] = { kCidWdr };
 			ControlList ctrls = sensor_->getControls(cids);
@@ -2707,10 +2707,11 @@ bool PiSPCameraData::initCcmpUnwrap()
 	 *   V4L2_CID_IMX585_HDR_GRAD_COMP_L  0x00982903 (menu,   ACMP1_EXP)
 	 *   V4L2_CID_IMX585_HDR_GRAD_COMP_H  0x00982904 (menu,   ACMP2_EXP)
 	 */
-	constexpr uint32_t kCidWdr     = 0x009a0915; /* V4L2_CID_WIDE_DYNAMIC_RANGE */
-	constexpr uint32_t kCidGradTh  = 0x00982902;
-	constexpr uint32_t kCidGradL   = 0x00982903;
-	constexpr uint32_t kCidGradH   = 0x00982904;
+	constexpr uint32_t kCidWdr     = V4L2_CID_WIDE_DYNAMIC_RANGE;
+	/* IMX585 vendor controls — not in linux/v4l2-controls.h. */
+	constexpr uint32_t kCidGradTh  = 0x00982902; /* V4L2_CID_IMX585_HDR_GRAD_TH */
+	constexpr uint32_t kCidGradL   = 0x00982903; /* V4L2_CID_IMX585_HDR_GRAD_COMP_L */
+	constexpr uint32_t kCidGradH   = 0x00982904; /* V4L2_CID_IMX585_HDR_GRAD_COMP_H */
 
 	const ControlInfoMap &info = sensor_->controls();
 	if (info.find(kCidWdr) == info.end() ||
@@ -2752,7 +2753,7 @@ bool PiSPCameraData::initCcmpUnwrap()
 	 * readable, so the LUT still pivots on a sane pedestal even when the
 	 * V4L2 read fails.
 	 */
-	constexpr uint32_t kCidBrightness = 0x00980900; /* V4L2_CID_BRIGHTNESS */
+	constexpr uint32_t kCidBrightness = V4L2_CID_BRIGHTNESS;
 	int32_t blc_reg = 50; /* IMX585 driver default */
 	if (info.find(kCidBrightness) != info.end()) {
 		const uint32_t blcCids[] = { kCidBrightness };

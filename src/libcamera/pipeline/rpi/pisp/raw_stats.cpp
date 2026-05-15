@@ -16,14 +16,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <memory>
 
-#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 
 #include <libcamera/control_ids.h>
 
-#include "libcamera/internal/yaml_parser.h"
+#include "tuning_helpers.h"
 
 namespace libcamera {
 
@@ -32,83 +30,6 @@ LOG_DECLARE_CATEGORY(RPI)
 RawStatsProducer::RawStatsProducer()
 {
 }
-
-namespace {
-
-/*
- * Pull the weights[] grid for `modeName` out of the rpi.agc metering_modes
- * dict at /usr/local/share/libcamera/ipa/rpi/pisp/<sensorModel>.json.
- *
- * Two tuning structures are supported (matches what the AGC IPA accepts):
- *   1. Flat:        rpi.agc.metering_modes.<name>.weights  (imx294-style)
- *   2. Multi-chan:  rpi.agc.channels[].metering_modes.<name>.weights
- *                                                          (imx585 HDR-style)
- * For (2) we read from channel 0 — that's the primary AGC channel the IPA
- * runs on for the SW-stats path (HDR channel selection happens above and
- * doesn't affect the SW kernel's weight lookup).
- *
- * Empty result if anything fails. `firstName`, if non-null, is set to the
- * first-listed mode found (matches the IPA's defaultMeteringMode).
- */
-std::vector<uint16_t> loadMeteringWeightsForMode(const std::string &sensorModel,
-						 const std::string &modeName,
-						 std::string *firstName = nullptr)
-{
-	std::vector<uint16_t> out;
-	const std::string tuningPath =
-		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
-	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly))
-		return out;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
-	if (!root)
-		return out;
-
-	auto pickFromModes = [&](const YamlObject &modes) -> const YamlObject * {
-		const YamlObject *pick = nullptr;
-		for (const auto &[name, node] : modes.asDict()) {
-			if (firstName && firstName->empty())
-				*firstName = name;
-			if (name == modeName) {
-				pick = &node;
-				break;
-			}
-		}
-		return pick;
-	};
-
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &agc = entry["rpi.agc"];
-		if (!agc.isDictionary())
-			continue;
-
-		/* Flat (imx294) or multi-channel (imx585) layout. */
-		const YamlObject *modes = nullptr;
-		const YamlObject &flat = agc["metering_modes"];
-		if (flat.isDictionary())
-			modes = &flat;
-		else if (agc["channels"].isList() && agc["channels"].size() > 0) {
-			const YamlObject &ch0 = agc["channels"][std::size_t(0)];
-			const YamlObject &chmm = ch0["metering_modes"];
-			if (chmm.isDictionary())
-				modes = &chmm;
-		}
-		if (!modes)
-			continue;
-
-		const YamlObject *pick = pickFromModes(*modes);
-		if (!pick)
-			break;
-		const YamlObject &weights = (*pick)["weights"];
-		out.reserve(weights.size());
-		for (const YamlObject &w : weights.asList())
-			out.push_back(w.get<uint16_t>().value_or(1));
-		break;
-	}
-	return out;
-}
-
-} /* anonymous namespace */
 
 void RawStatsProducer::loadMeteringWeights(const std::string &sensorModel)
 {
@@ -177,24 +98,10 @@ void RawStatsProducer::setMeteringMode(const std::string &modeName)
 
 uint16_t RawStatsProducer::loadBlackLevel(const std::string &sensorModel)
 {
-	const std::string tuningPath =
-		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
-	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly))
-		return 0;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
-	if (!root)
-		return 0;
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &bl = entry["rpi.black_level"];
-		if (!bl.isDictionary())
-			continue;
-		uint16_t v = bl["black_level"].get<uint16_t>(0);
-		if (v != 0)
-			blackLevel_.store(v, std::memory_order_relaxed);
-		return v;
-	}
-	return 0;
+	uint16_t v = loadBlackLevelFromTuning(sensorModel);
+	if (v != 0)
+		blackLevel_.store(v, std::memory_order_relaxed);
+	return v;
 }
 
 void RawStatsProducer::setBlackLevel(uint16_t blc)
@@ -210,11 +117,6 @@ void RawStatsProducer::updateWbGains(const ControlList &metadata)
 	wbGainR_.store((*gains)[0], std::memory_order_relaxed);
 	wbGainB_.store((*gains)[1], std::memory_order_relaxed);
 	wbGainG_.store(1.0f, std::memory_order_relaxed);
-}
-
-void RawStatsProducer::setLinearizationLut(const uint16_t *lut)
-{
-	linearizationLut_.store(lut, std::memory_order_release);
 }
 
 void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
@@ -312,36 +214,20 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			}
 		};
 
-		/*
-		 * Optional CCMP-inverse LUT. When set, each compressed u16
-		 * pixel is replaced with its linearised u16 before any further
-		 * accumulation — the BLC subtraction, BT.601 Y dot-product,
-		 * and zone summation all run on the linear-domain values.
-		 * Lookup is scalar (no NEON gather for 4096-entry tables); LUT
-		 * fits in L1.
-		 */
-		const uint16_t *lut = linearizationLut_.load(std::memory_order_acquire);
-
 		for (unsigned int p = 0; p < cellPairs; p++) {
 			const unsigned int x0 = p * 8;
 
 			uint16x8_t v0 = vld1q_u16(row0 + x0);  /* R G R G R G R G */
 			uint16x8_t v1 = vld1q_u16(row1 + x0);  /* G B G B G B G B */
 
-			if (lut) {
-				uint16_t a0[8], a1[8];
-				vst1q_u16(a0, v0);
-				vst1q_u16(a1, v1);
-				for (int k = 0; k < 8; k++) {
-					a0[k] = lut[a0[k] >> 4];
-					a1[k] = lut[a1[k] >> 4];
-				}
-				v0 = vld1q_u16(a0);
-				v1 = vld1q_u16(a1);
-			}
-
-			/* Deinterleave evens/odds in each row, widen to u32 so
-			 * the per-zone accumulations don't wrap. */
+			/*
+			 * Deinterleave evens/odds in each row, widen to u32 so
+			 * the per-zone accumulations don't wrap. vuzp1/2(v, v)
+			 * deinterleaves a single 8-lane vector into a 4-lane
+			 * result (evens or odds) duplicated in both halves; we
+			 * take the low half. Avoids a vld2q which would need
+			 * 16 contiguous source lanes we don't have here.
+			 */
 			uint32x4_t r_evens = vmovl_u16(vget_low_u16(vuzp1q_u16(v0, v0)));
 			uint32x4_t g_odds  = vmovl_u16(vget_low_u16(vuzp2q_u16(v0, v0)));
 			uint32x4_t g_evens = vmovl_u16(vget_low_u16(vuzp1q_u16(v1, v1)));
@@ -380,7 +266,7 @@ void RawStatsProducer::process(const uint16_t *rawPx, pisp_statistics *st,
 			uint32_t y = static_cast<uint32_t>(y_q >> 12);
 			if (y > 65535)
 				y = 65535;
-			unsigned int bin = y >> 6;
+			unsigned int bin = y >> PISP_AGC_HIST_BIN_SHIFT;
 
 			/* The pair covers 4 RGGB cells (= 16 pixels). Sum the
 			 * cell-weights for proper metering, default to 4 (=

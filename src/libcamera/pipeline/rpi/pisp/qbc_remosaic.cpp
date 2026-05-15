@@ -39,17 +39,15 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <memory>
 #include <thread>
 
-#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 
 #include <libpisp/frontend/pisp_statistics.h>
 
 #include <libcamera/control_ids.h>
 
-#include "libcamera/internal/yaml_parser.h"
+#include "tuning_helpers.h"
 
 namespace libcamera {
 
@@ -58,73 +56,6 @@ LOG_DECLARE_CATEGORY(RPI)
 QbcRemosaic::QbcRemosaic()
 {
 }
-
-namespace {
-
-/*
- * Pull weights[] for `modeName` from the tuning JSON. Supports both the
- * imx294-style flat rpi.agc.metering_modes layout and the imx585-style
- * channels[0].metering_modes (multi-channel AGC for HDR). See the
- * RawStatsProducer version for the full discussion.
- */
-std::vector<uint16_t> loadQbcMeteringWeightsForMode(const std::string &sensorModel,
-						    const std::string &modeName,
-						    std::string *firstName = nullptr)
-{
-	std::vector<uint16_t> out;
-	const std::string tuningPath =
-		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
-	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly))
-		return out;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
-	if (!root)
-		return out;
-
-	auto pickFromModes = [&](const YamlObject &modes) -> const YamlObject * {
-		const YamlObject *pick = nullptr;
-		for (const auto &[name, node] : modes.asDict()) {
-			if (firstName && firstName->empty())
-				*firstName = name;
-			if (name == modeName) {
-				pick = &node;
-				break;
-			}
-		}
-		return pick;
-	};
-
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &agc = entry["rpi.agc"];
-		if (!agc.isDictionary())
-			continue;
-
-		const YamlObject *modes = nullptr;
-		const YamlObject &flat = agc["metering_modes"];
-		if (flat.isDictionary())
-			modes = &flat;
-		else if (agc["channels"].isList() && agc["channels"].size() > 0) {
-			const YamlObject &ch0 = agc["channels"][std::size_t(0)];
-			const YamlObject &chmm = ch0["metering_modes"];
-			if (chmm.isDictionary())
-				modes = &chmm;
-		}
-		if (!modes)
-			continue;
-
-		const YamlObject *pick = pickFromModes(*modes);
-		if (!pick)
-			break;
-		const YamlObject &weights = (*pick)["weights"];
-		out.reserve(weights.size());
-		for (const YamlObject &w : weights.asList())
-			out.push_back(w.get<uint16_t>().value_or(1));
-		break;
-	}
-	return out;
-}
-
-} /* anonymous namespace */
 
 void QbcRemosaic::loadMeteringWeights(const std::string &sensorModel)
 {
@@ -136,13 +67,13 @@ void QbcRemosaic::loadMeteringWeights(const std::string &sensorModel)
 	meteringGridW_ = meteringGridH_ = 0;
 
 	std::string first;
-	(void)loadQbcMeteringWeightsForMode(sensorModel, "", &first);
+	(void)loadMeteringWeightsForMode(sensorModel, "", &first);
 	if (first.empty()) {
 		LOG(RPI, Warning) << "QBC: no metering modes in tuning for "
 				  << sensorModel << " — uniform metering";
 		return;
 	}
-	auto weights = loadQbcMeteringWeightsForMode(sensorModel, first);
+	auto weights = loadMeteringWeightsForMode(sensorModel, first);
 	if (weights.empty()) {
 		LOG(RPI, Warning) << "QBC: empty weights for '" << first
 				  << "' in " << sensorModel << " tuning — uniform";
@@ -167,7 +98,7 @@ void QbcRemosaic::setMeteringMode(const std::string &modeName)
 	std::lock_guard<std::mutex> lk(meteringMutex_);
 	if (modeName == meteringModeName_ || sensorModel_.empty())
 		return;
-	auto weights = loadQbcMeteringWeightsForMode(sensorModel_, modeName);
+	auto weights = loadMeteringWeightsForMode(sensorModel_, modeName);
 	if (weights.empty()) {
 		LOG(RPI, Warning) << "QBC: metering mode '" << modeName
 				  << "' not in " << sensorModel_
@@ -191,24 +122,10 @@ void QbcRemosaic::setMeteringMode(const std::string &modeName)
 
 uint16_t QbcRemosaic::loadBlackLevel(const std::string &sensorModel)
 {
-	const std::string tuningPath =
-		"/usr/local/share/libcamera/ipa/rpi/pisp/" + sensorModel + ".json";
-	File f(tuningPath);
-	if (!f.open(File::OpenModeFlag::ReadOnly))
-		return 0;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
-	if (!root)
-		return 0;
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &bl = entry["rpi.black_level"];
-		if (!bl.isDictionary())
-			continue;
-		uint16_t v = bl["black_level"].get<uint16_t>(0);
-		if (v != 0)
-			blackLevel_.store(v, std::memory_order_relaxed);
-		return v;
-	}
-	return 0;
+	uint16_t v = loadBlackLevelFromTuning(sensorModel);
+	if (v != 0)
+		blackLevel_.store(v, std::memory_order_relaxed);
+	return v;
 }
 
 void QbcRemosaic::setBlackLevel(uint16_t blc)
@@ -277,33 +194,7 @@ constexpr OutputLUT kRemosaicLUT[16] = {
 	/* (3,3) B */ {15, 15},
 };
 
-/*
- * Smooth-region output: tile sub-block averages as 2×2 RGGB.
- * Indices into a 4-element {Ravg, GTavg, GBavg, Bavg} array.
- */
-constexpr uint8_t kSmoothLUT[16] = {
-	0, 1, 0, 1,
-	2, 3, 2, 3,
-	0, 1, 0, 1,
-	2, 3, 2, 3,
-};
-
 constexpr unsigned int N_THREADS = 3;
-
-/*
- * Smooth-macro threshold (sum of gH+gV, where each gradient is a difference
- * of two 4-pixel sub-block sums). Empirically: below this, the macro is
- * locally flat and aliasing from spatial relocation matters more than the
- * minute detail; emit the sub-block averages instead.
- *
- *   pixel range          ≤ 65535
- *   sub-block sum range  ≤ 4 × 65535 ≈ 2.6e5
- *   max grad            ≈ 2 × 2.6e5 = 5.2e5
- * A 4096-code threshold (~ 1.5% of full sub-block-sum range, or 250 codes
- * per-pixel difference between sub-block averages) marks genuinely flat
- * regions without bleeding into mild texture.
- */
-constexpr uint32_t SMOOTH_GRAD_THRESH = 4096;
 
 struct ThreadState {
 	uint32_t hist[PISP_AGC_STATS_NUM_BINS] = {};
@@ -527,7 +418,7 @@ void QbcRemosaic::process(uint16_t *rawPx, pisp_statistics *st,
 					uint32_t y = (uint32_t)(y_q >> 10);
 					if (y > 65535)
 						y = 65535;
-					state.hist[y >> 6] += w;
+					state.hist[y >> PISP_AGC_HIST_BIN_SHIFT] += w;
 					state.totalY += y;
 				};
 				for (int i = 0; i < 4; i++) {
