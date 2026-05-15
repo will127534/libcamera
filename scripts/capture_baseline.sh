@@ -58,10 +58,12 @@ WEEYLITE_OPTS=(env WEEYLITE_CHANNEL=2 WEEYLITE_GROUP=A python3 "$LED_PY")
 mkdir -p "$OUT"
 
 imx585_subdev() {
+    # media-ctl writes "Entity '...' not found" to STDOUT (not stderr) and
+    # exits 0 even on lookup failure, so filter for an actual /dev/ path.
     for m in /dev/media*; do
         local s
         s=$(media-ctl -d "$m" -e "imx585 10-001a" 2>/dev/null) || true
-        [ -n "$s" ] && { echo "$s"; return; }
+        [[ "$s" == /dev/* ]] && { echo "$s"; return; }
     done
     return 1
 }
