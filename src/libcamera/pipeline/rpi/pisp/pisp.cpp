@@ -2931,6 +2931,23 @@ void PiSPCameraData::tryRunPipeline()
 	if (wdrActive_ && !params.requestControls.contains(controls::HDR_MODE))
 		params.requestControls.set(controls::HdrMode, controls::HdrModeSingleExposure);
 
+	/*
+	 * QBC mode (IMX294 full sub-pixel readout) saturates each sub-pixel
+	 * at ~46% of the 16-bit container (empirically 30528, well below
+	 * the 12-bit ADC ceiling of 4095 / 65520 — likely an analog-stage
+	 * gain choice for highlight headroom; datasheet Vsat is "TBD"). The
+	 * IPA's default AGC constraint targets full 16-bit Y so it pumps ET
+	 * past sub-pixel saturation in bright scenes; the saturated
+	 * highlights then trip the post-WB B-channel into clipping and the
+	 * BE CCM crushes G to magenta. Activate the tuning JSON's
+	 * "highlight" constraint mode — adds an UPPER 0.466 cap on the top
+	 * quantile — so AGC keeps highlights below the sub-pixel saturation.
+	 * Only applies when the user hasn't explicitly chosen a constraint.
+	 */
+	if (qbc_ && !params.requestControls.contains(controls::AE_CONSTRAINT_MODE))
+		params.requestControls.set(controls::AeConstraintMode,
+					   controls::ConstraintHighlight);
+
 	if (sensorMetadata_) {
 		unsigned int embeddedId =
 			cfe_[Cfe::Embedded].getBufferId(job.buffers[&cfe_[Cfe::Embedded]]);
