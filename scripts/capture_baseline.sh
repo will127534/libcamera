@@ -46,7 +46,7 @@ set -u
 
 CCT=${1:-5500}
 POWER=${2:-70}
-OUT=${OUT:-/home/pi/quadbayer_clearHDR_support/libcamera/baseline}
+OUT=${OUT:-/home/pi/quadbayer_clearHDR_support/baseline}
 TIMEOUT_AUTO_MS=${TIMEOUT_AUTO_MS:-15000}    # auto-mode: AGC/AWB convergence
 TIMEOUT_MANUAL_MS=${TIMEOUT_MANUAL_MS:-4000} # manual: no convergence needed
 LIBCAMERA_LOG_LEVELS=${LIBCAMERA_LOG_LEVELS:-RPiAwb:1,RPiAgc:1,RPI:0}
