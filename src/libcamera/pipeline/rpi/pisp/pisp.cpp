@@ -879,6 +879,16 @@ private:
 	 */
 	std::unique_ptr<CcmpUnwrap> ccmpUnwrap_;
 
+	/*
+	 * Tracks whether the sensor is in WDR / ClearHDR mode (set in
+	 * configureCfe from the sensor's V4L2 wide_dynamic_range control).
+	 * Forwarded to the IPA per-frame as HdrMode=SingleExposure so the
+	 * IPA can adjust pipeline configuration that depends on HDR state
+	 * (e.g. disabling FE BLA on the IMX585 12-bit CCMP path, where it
+	 * would otherwise double-correct against the SW CCMP unwrap).
+	 */
+	bool wdrActive_ = false;
+
 	void processQbcFrame(FrameBuffer *raw, FrameBuffer *stats);
 	void processRawStats(FrameBuffer *raw, FrameBuffer *stats);
 
@@ -1601,6 +1611,7 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 				wdrActive = true;
 		}
 	}
+	wdrActive_ = wdrActive;
 
 	/*
 	 * High-bit-depth SW stats fallback. The CFE statistics engine has a
@@ -2909,6 +2920,16 @@ void PiSPCameraData::tryRunPipeline()
 	params.delayContext = job.delayContext;
 	params.sensorControls = std::move(job.sensorControls);
 	params.requestControls = request->controls();
+
+	/*
+	 * If the sensor is in ClearHDR mode (set out-of-band via
+	 * v4l2-ctl wide_dynamic_range=1), surface that to the IPA via the
+	 * standard HdrMode control unless the user already supplied one.
+	 * The IPA records the requested mode and uses it to gate
+	 * sensor-specific behaviour (see applyBlackLevel for IMX585 CCMP).
+	 */
+	if (wdrActive_ && !params.requestControls.contains(controls::HDR_MODE))
+		params.requestControls.set(controls::HdrMode, controls::HdrModeSingleExposure);
 
 	if (sensorMetadata_) {
 		unsigned int embeddedId =

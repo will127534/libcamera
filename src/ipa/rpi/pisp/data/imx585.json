@@ -4,7 +4,10 @@
   "algorithms": [
     {
       "rpi.black_level": {
-        "black_level": 3200
+        "black_level": 3200,
+        "black_level_r": 3301,
+        "black_level_g": 3321,
+        "black_level_b": 3240
       }
     },
     {
