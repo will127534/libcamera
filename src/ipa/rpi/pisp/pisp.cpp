@@ -680,22 +680,69 @@ void IpaPiSP::applyBlackLevel(const BlackLevelStatus *blackLevelStatus, pisp_be_
 	pisp_bla_config bla;
 
 	/*
-	 * Set the Frontend to adjust the black level to the smallest black level
-	 * of all channels (in 16-bits).
+	 * IMX585 ClearHDR-12 (CCMP) gate: when WDR is active and the sensor
+	 * delivers 12-bit gradation-compressed raw, the SW CCMP-unwrap kernel
+	 * applies a BLC-aware inverse to reconstruct linear pixels. If FE BLA
+	 * has already subtracted per-channel pedestals before the buffer is
+	 * written, the inverse double-corrects (G ends up suppressed by
+	 * ~20 LSB on a balanced scene). Treat this mode like 14/16-bit and
+	 * route per-channel BLC through BE BLC instead.
+	 *
+	 * Sensor-model-gated rather than HDR-gated to avoid disturbing
+	 * IMX708's on-sensor frame-stitched HDR, which doesn't share CCMP's
+	 * stacked-compression path.
 	 */
-	bla.black_level_r = blackLevelStatus->blackLevelR;
-	bla.black_level_gr = blackLevelStatus->blackLevelG;
-	bla.black_level_gb = blackLevelStatus->blackLevelG;
-	bla.black_level_b = blackLevelStatus->blackLevelB;
-	bla.output_black_level = minBlackLevel;
-	fe_->SetBla(bla);
+	bool imx585HdrCcmp = (sensorModel_ == "imx585" && mode_.bitdepth == 12 &&
+			      !requestedHdrMode_.empty() && requestedHdrMode_ != "Off");
+	if (mode_.bitdepth >= 14 || imx585HdrCcmp) {
+		/*
+		 * RAW14 / RAW16 path: the CFE→FE input is big-endian (omitted
+		 * byte-swap in CSI2AXI) while FE pixel blocks assume little-
+		 * endian, so any non-trivial FE pixel processing corrupts the
+		 * data. Per upstream guidance (libcamera issue #99 — comment
+		 * by njhollinghurst), Decompand/BLA/DPC/Downscale/Compress
+		 * must be disabled or no-op'd. SW endian-swap fixes the FE
+		 * output buffer before BE consumes it.
+		 *
+		 * Same no-op shape works for the IMX585 HDR-12 CCMP path
+		 * (different cause: CCMP unwrap subtracts the pedestal itself,
+		 * so FE BLA must not pre-subtract).
+		 *
+		 * Configure FE BLA + FE BLC as no-op (all zeros) and apply
+		 * the per-channel pedestal correction from the tuning JSON at
+		 * BE BLC, where the pixels are correctly oriented.
+		 */
+		bla.black_level_r = bla.black_level_gr =
+			bla.black_level_gb = bla.black_level_b = 0;
+		bla.output_black_level = 0;
+		fe_->SetBla(bla);
+		fe_->SetBlc(bla);
 
-	/* Frontend Stats and Backend black level correction. */
-	bla.black_level_r = bla.black_level_gr =
-		bla.black_level_gb = bla.black_level_b = minBlackLevel;
-	bla.output_black_level = 0;
-	fe_->SetBlc(bla);
-	be_->SetBlc(bla);
+		bla.black_level_r = blackLevelStatus->blackLevelR;
+		bla.black_level_gr = blackLevelStatus->blackLevelG;
+		bla.black_level_gb = blackLevelStatus->blackLevelG;
+		bla.black_level_b = blackLevelStatus->blackLevelB;
+		bla.output_black_level = 0;
+		be_->SetBlc(bla);
+	} else {
+		/*
+		 * SDR / COMP1 path: FE BLA does the per-channel correction,
+		 * normalising output to the smallest black level. BE BLC then
+		 * subtracts that residual uniform minBlc.
+		 */
+		bla.black_level_r = blackLevelStatus->blackLevelR;
+		bla.black_level_gr = blackLevelStatus->blackLevelG;
+		bla.black_level_gb = blackLevelStatus->blackLevelG;
+		bla.black_level_b = blackLevelStatus->blackLevelB;
+		bla.output_black_level = minBlackLevel;
+		fe_->SetBla(bla);
+
+		bla.black_level_r = bla.black_level_gr =
+			bla.black_level_gb = bla.black_level_b = minBlackLevel;
+		bla.output_black_level = 0;
+		fe_->SetBlc(bla);
+		be_->SetBlc(bla);
+	}
 	global.bayer_enables |= PISP_BE_BAYER_ENABLE_BLC;
 }
 
