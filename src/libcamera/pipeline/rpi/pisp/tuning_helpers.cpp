@@ -30,12 +30,12 @@ std::vector<uint16_t> loadMeteringWeightsForMode(const std::string &sensorModel,
 	File f(tuningPathFor(sensorModel));
 	if (!f.open(File::OpenModeFlag::ReadOnly))
 		return out;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
+	std::unique_ptr<ValueNode> root = YamlParser::parse(f);
 	if (!root)
 		return out;
 
-	auto pickFromModes = [&](const YamlObject &modes) -> const YamlObject * {
-		const YamlObject *pick = nullptr;
+	auto pickFromModes = [&](const ValueNode &modes) -> const ValueNode * {
+		const ValueNode *pick = nullptr;
 		for (const auto &[name, node] : modes.asDict()) {
 			if (firstName && firstName->empty())
 				*firstName = name;
@@ -47,31 +47,31 @@ std::vector<uint16_t> loadMeteringWeightsForMode(const std::string &sensorModel,
 		return pick;
 	};
 
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &agc = entry["rpi.agc"];
+	for (const ValueNode &entry : (*root)["algorithms"].asList()) {
+		const ValueNode &agc = entry["rpi.agc"];
 		if (!agc.isDictionary())
 			continue;
 
 		/* Flat (imx294) or multi-channel (imx585) layout. */
-		const YamlObject *modes = nullptr;
-		const YamlObject &flat = agc["metering_modes"];
+		const ValueNode *modes = nullptr;
+		const ValueNode &flat = agc["metering_modes"];
 		if (flat.isDictionary())
 			modes = &flat;
 		else if (agc["channels"].isList() && agc["channels"].size() > 0) {
-			const YamlObject &ch0 = agc["channels"][std::size_t(0)];
-			const YamlObject &chmm = ch0["metering_modes"];
+			const ValueNode &ch0 = agc["channels"][std::size_t(0)];
+			const ValueNode &chmm = ch0["metering_modes"];
 			if (chmm.isDictionary())
 				modes = &chmm;
 		}
 		if (!modes)
 			continue;
 
-		const YamlObject *pick = pickFromModes(*modes);
+		const ValueNode *pick = pickFromModes(*modes);
 		if (!pick)
 			break;
-		const YamlObject &weights = (*pick)["weights"];
+		const ValueNode &weights = (*pick)["weights"];
 		out.reserve(weights.size());
-		for (const YamlObject &w : weights.asList())
+		for (const ValueNode &w : weights.asList())
 			out.push_back(w.get<uint16_t>().value_or(1));
 		break;
 	}
@@ -83,11 +83,11 @@ uint16_t loadBlackLevelFromTuning(const std::string &sensorModel)
 	File f(tuningPathFor(sensorModel));
 	if (!f.open(File::OpenModeFlag::ReadOnly))
 		return 0;
-	std::unique_ptr<YamlObject> root = YamlParser::parse(f);
+	std::unique_ptr<ValueNode> root = YamlParser::parse(f);
 	if (!root)
 		return 0;
-	for (const YamlObject &entry : (*root)["algorithms"].asList()) {
-		const YamlObject &bl = entry["rpi.black_level"];
+	for (const ValueNode &entry : (*root)["algorithms"].asList()) {
+		const ValueNode &bl = entry["rpi.black_level"];
 		if (!bl.isDictionary())
 			continue;
 		return bl["black_level"].get<uint16_t>(0);
