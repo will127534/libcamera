@@ -152,6 +152,7 @@ int32_t IpaBase::init(const IPASettings &settings, const InitParams &params, Ini
 				   << settings.sensorModel;
 		return -EINVAL;
 	}
+	sensorModel_ = settings.sensorModel;
 
 	/* Pass out the sensor metadata to the pipeline handler */
 	int sensorMetadata = helper_->sensorEmbeddedDataPresent();
@@ -1426,15 +1427,28 @@ void IpaBase::applyControls(const ControlList &controls)
 		}
 
 		case controls::HDR_MODE: {
-			HdrAlgorithm *hdr = dynamic_cast<HdrAlgorithm *>(controller_.getAlgorithm("hdr"));
-			if (!hdr) {
-				LOG(IPARPI, Warning) << "No HDR algorithm available";
-				break;
-			}
-
 			auto mode = HdrModeTable.find(ctrl.second.get<int32_t>());
 			if (mode == HdrModeTable.end()) {
 				LOG(IPARPI, Warning) << "Unrecognised HDR mode";
+				break;
+			}
+
+			/*
+			 * Record the user-requested HDR mode regardless of
+			 * whether an HDR algorithm is configured for this
+			 * sensor. Sensors like IMX585 use sensor-side ClearHDR
+			 * (no IPA HDR algorithm) but downstream code (e.g.
+			 * applyBlackLevel) still needs to know that HDR was
+			 * requested so it can adjust pipeline configuration.
+			 * Stored separately from hdrStatus_ which is owned by
+			 * the AGC/HDR-algorithm flow.
+			 */
+			requestedHdrMode_ = mode->second;
+
+			HdrAlgorithm *hdr = dynamic_cast<HdrAlgorithm *>(controller_.getAlgorithm("hdr"));
+			if (!hdr) {
+				LOG(IPARPI, Warning) << "No HDR algorithm available; recorded requested mode '"
+						     << mode->second << "' only";
 				break;
 			}
 

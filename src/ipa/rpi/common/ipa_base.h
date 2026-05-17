@@ -58,6 +58,13 @@ protected:
 	std::unique_ptr<RPiController::CamHelper> helper_;
 	RPiController::Controller controller_;
 
+	/*
+	 * Sensor model name (e.g. "imx585", "imx294"), captured at init() time.
+	 * Lets platform IPAs gate sensor-specific quirks without a virtual on
+	 * CamHelper for every one-off.
+	 */
+	std::string sensorModel_;
+
 	ControlInfoMap sensorCtrls_;
 	ControlInfoMap lensCtrls_;
 
@@ -72,6 +79,15 @@ protected:
 
 	/* Remember the HDR status after a mode switch. */
 	HdrStatus hdrStatus_;
+
+	/*
+	 * User-requested HDR mode (from controls::HdrMode). Set by the IPA
+	 * setControls handler and not touched by the AGC status flow, so it
+	 * remains valid for sensors without an in-IPA HDR algorithm (e.g.
+	 * IMX585 ClearHDR, where the sensor itself does the HDR). Empty
+	 * string means no request seen yet.
+	 */
+	std::string requestedHdrMode_;
 
 	/* Remember the AGC status after a mode switch. */
 	AgcStatus agcStatus_;
