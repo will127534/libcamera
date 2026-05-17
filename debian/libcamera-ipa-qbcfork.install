@@ -1,0 +1,6 @@
+usr/lib/*/libcamera/ipa/ipa_rpi_pisp.so
+usr/lib/*/libcamera/ipa/ipa_rpi_pisp.so.sign
+usr/lib/*/libcamera/ipa/ipa_rpi_vc4.so
+usr/lib/*/libcamera/ipa/ipa_rpi_vc4.so.sign
+usr/libexec/libcamera/raspberrypi_ipa_proxy
+usr/share/libcamera/

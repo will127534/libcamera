@@ -1,0 +1,19 @@
+libcamera-qbcfork (0.7.1+qbcfork.20260517-1) trixie; urgency=medium
+
+  * Initial Debian packaging for the IMX294 QBC + IMX585 ClearHDR libcamera
+    fork. Pairs with rpicam-apps-qbcfork.
+  * Tracks upstream libcamera 0.7.1 (post-2026-05 rebase onto
+    raspberrypi/libcamera:main). Fork commits add IMX294 QBC software
+    remosaic and stats producer, IMX585 ClearHDR (CCMP unwrap,
+    per-channel BLC, SW stats for high-bit-depth raw paths), tuning
+    JSONs for IMX585/IMX294, and a NEON-accelerated R/B bilinear pass.
+  * Split into six binary packages mirroring upstream Debian's libcamera
+    source-package layout: libcamera0.7-qbcfork, libcamera-ipa-qbcfork,
+    libcamera-v4l2-qbcfork (also takes the libcamera-tools slot since
+    qcam/cam/lc-compliance are not built), python3-libcamera-qbcfork,
+    libcamera-dev-qbcfork. Each Conflicts/Replaces/Provides its upstream
+    counterpart so apt swaps them in cleanly and picamera2's
+    python3-libcamera dependency is satisfied by the fork's python
+    bindings.
+
+ -- IMX294 QBC fork <will127534@gmail.com>  Sun, 17 May 2026 02:27:16 +0000

@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+# libcamera-qbcfork — Debian packaging glue.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export PYBUILD_NAME = libcamera
+
+%:
+	dh $@ --buildsystem=meson --with python3
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+	  --buildtype=release \
+	  -Dpipelines=rpi/vc4,rpi/pisp \
+	  -Dipas=rpi/vc4,rpi/pisp \
+	  -Dgstreamer=disabled \
+	  -Dpycamera=enabled \
+	  -Dqcam=disabled \
+	  -Dcam=disabled \
+	  -Dlc-compliance=disabled \
+	  -Ddocumentation=disabled \
+	  -Dtest=false \
+	  -Dv4l2=enabled
+
+override_dh_auto_test:
+	# no upstream tests to run
+
+# Don't strip debug info from IPA .so plugins (they're signed and stripping
+# can break the signature path).
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+# On a build host with libpisp installed under /usr/local (e.g. the developer
+# Pi) the linker picks up that copy of libpisp.so.1, which dpkg-shlibdeps then
+# can't resolve to a Debian package. The runtime host gets libpisp1 from the
+# raspberrypi apt repo, so the dependency is satisfied at install time; tell
+# shlibdeps not to fail on the missing info.
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info

@@ -1,0 +1,135 @@
+Source: libcamera-qbcfork
+Section: libs
+Priority: optional
+Maintainer: IMX294 QBC fork <will127534@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ meson (>= 1.0.1),
+ ninja-build,
+ pkg-config,
+ python3,
+ python3-dev,
+ python3-jinja2,
+ python3-ply,
+ python3-yaml,
+ pybind11-dev,
+ libudev-dev,
+ libyaml-dev,
+ libgnutls28-dev,
+ openssl,
+ libtiff-dev,
+ libevent-dev,
+ libdrm-dev,
+ libboost-dev,
+ libyuv-dev,
+ libpisp-dev,
+Standards-Version: 4.7.0
+Homepage: https://github.com/will127534/libcamera
+Rules-Requires-Root: no
+
+Package: libcamera0.7-qbcfork
+Architecture: arm64 armhf
+Multi-Arch: same
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libcamera-ipa-qbcfork (= ${binary:Version}),
+ libpisp1 (>= 1.5.0),
+Conflicts:
+ libcamera0,
+ libcamera0.6,
+ libcamera0.7,
+Replaces:
+ libcamera0,
+ libcamera0.6,
+ libcamera0.7,
+Provides:
+ libcamera0.7 (= 0.7.1),
+Description: Complex camera support library (IMX294 QBC + IMX585 ClearHDR fork)
+ Fork of libcamera carrying an IMX294 quad-Bayer (QBC) software remosaic
+ in the PiSP pipeline handler plus IMX585 ClearHDR support (CCMP unwrap,
+ per-channel BLC, software stats for high-bit-depth raw paths). Pairs
+ with rpicam-apps-qbcfork.
+ .
+ This binary package contains the libcamera and libcamera-base shared
+ libraries.
+
+Package: libcamera-ipa-qbcfork
+Architecture: arm64 armhf
+Multi-Arch: same
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Conflicts:
+ libcamera-ipa,
+Replaces:
+ libcamera-ipa,
+Provides:
+ libcamera-ipa (= ${binary:Version}),
+Description: Complex camera support library - IPA modules (QBC fork)
+ IPA (Image Processing Algorithm) modules for the libcamera-qbcfork
+ build, including the rpi/vc4 and rpi/pisp IPAs with fork-specific
+ tuning for IMX294 QBC and IMX585 ClearHDR. Ships the libcamera data
+ tree (tuning JSONs, signed IPA proxy helper) under /usr/share and
+ /usr/libexec.
+
+Package: libcamera-v4l2-qbcfork
+Architecture: arm64 armhf
+Multi-Arch: same
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libcamera0.7-qbcfork (= ${binary:Version}),
+Conflicts:
+ libcamera-v4l2,
+ libcamera-tools,
+Replaces:
+ libcamera-v4l2,
+ libcamera-tools,
+Provides:
+ libcamera-v4l2 (= ${binary:Version}),
+ libcamera-tools (= ${binary:Version}),
+Description: Complex camera support library - V4L2 compatibility shim (QBC fork)
+ V4L2 compatibility layer (v4l2-compat.so) that lets legacy V4L2
+ applications consume libcamera cameras, plus the libcamerify wrapper
+ helper. Also takes over the upstream libcamera-tools package slot
+ since this fork builds without the qcam / cam / lc-compliance binaries
+ to keep the install footprint small.
+
+Package: python3-libcamera-qbcfork
+Section: python
+Architecture: arm64 armhf
+Multi-Arch: same
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ ${python3:Depends},
+ libcamera0.7-qbcfork (= ${binary:Version}),
+Conflicts:
+ python3-libcamera,
+Replaces:
+ python3-libcamera,
+Provides:
+ python3-libcamera (= ${binary:Version}),
+Description: Complex camera support library - Python bindings (QBC fork)
+ Python 3 bindings for the libcamera-qbcfork shared library, built
+ against the same libcamera 0.7.x ABI as the upstream python3-libcamera
+ package. Required by picamera2 when the QBC fork is the installed
+ libcamera stack.
+
+Package: libcamera-dev-qbcfork
+Section: libdevel
+Architecture: arm64 armhf
+Multi-Arch: same
+Depends:
+ ${misc:Depends},
+ libcamera0.7-qbcfork (= ${binary:Version}),
+Conflicts:
+ libcamera-dev,
+Replaces:
+ libcamera-dev,
+Provides:
+ libcamera-dev,
+Description: Complex camera support library - development files (QBC fork)
+ Headers and pkg-config files for building against libcamera-qbcfork.

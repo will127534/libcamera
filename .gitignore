@@ -7,3 +7,20 @@
 *.pyc
 __pycache__/
 venv/
+
+# Debian packaging build artifacts
+/obj-aarch64-linux-gnu/
+/obj-*/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/tmp/
+/debian/libcamera*-qbcfork/
+/debian/python3-libcamera-qbcfork/
+/debian/*.debhelper.log
+/debian/*.substvars
+/debian/*.postinst.debhelper
+/debian/*.prerm.debhelper
+*.deb
+*.changes
+*.buildinfo

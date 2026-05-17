@@ -1,0 +1,3 @@
+usr/libexec/libcamera/v4l2-compat.so
+usr/bin/libcamerify
+usr/bin/libcamera-bug-report

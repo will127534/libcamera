@@ -1,0 +1,2 @@
+usr/lib/*/libcamera.so.*
+usr/lib/*/libcamera-base.so.*
