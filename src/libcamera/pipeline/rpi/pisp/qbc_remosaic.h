@@ -111,6 +111,29 @@ private:
 	unsigned int meteringGridW_ = 0;
 	unsigned int meteringGridH_ = 0;
 	std::vector<uint8_t> macroWeight_;        /* per-macro weight cache */
+
+	/*
+	 * Per-thread rolling source-row scratch for the bilinear R/B post-pass.
+	 *
+	 * The QBC sampling structure puts all 4 R sub-pixels of each macro in
+	 * cols 0-1 of the macro footprint, and all 4 B sub-pixels in cols 2-3.
+	 * The LUT pass writes those source values into the output Bayer's R/B
+	 * positions with a 1- to 2-pixel spatial offset, creating a 4-pixel-
+	 * period bias visible as macro-block 'stipple' at 800%+ zoom on
+	 * smooth regions. The bilinear post-pass re-reads same-colour
+	 * sources and writes proper interpolated outputs to fix this.
+	 *
+	 * The post-pass needs the un-modified source values, but the LUT
+	 * pass writes in-place — so we keep a small ring of the last few
+	 * macro rows of source data per thread (kRingMacroRows × 4 lines ×
+	 * stride × kNumThreads), plus 2 boundary rows at the strip seam so
+	 * the per-thread halves of the bilinear pass produce bit-exact
+	 * output across the seam. The buffer is reused frame-to-frame and
+	 * only resized when geometry changes — ~400 KB total at full res
+	 * (3 macro-rows × 4 lines × stride per thread × 2 threads, plus the
+	 * 2 boundary rows) vs ~95 MB if we copied the whole frame.
+	 */
+	std::vector<uint16_t> sourceBuffer_;
 };
 
 } /* namespace libcamera */
