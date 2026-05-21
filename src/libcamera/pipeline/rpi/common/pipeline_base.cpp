@@ -341,13 +341,18 @@ bool PipelineHandlerBase::updateStreamConfig(StreamConfiguration *stream,
 		adjusted = true;
 	}
 
-	if (stream->colorSpace != format.colorSpace) {
-		stream->colorSpace = format.colorSpace;
+	std::optional<ColorSpace> oldColorSpace = stream->colorSpace;
+	std::optional<ColorSpace> colorSpace = format.colorSpace;
+	if (PipelineHandlerBase::isRaw(stream->pixelFormat))
+		colorSpace = ColorSpace::Raw;
+
+	if (oldColorSpace != colorSpace) {
+		stream->colorSpace = colorSpace;
 		adjusted = true;
 		LOG(RPI, Debug)
 			<< "Color space changed from "
-			<< ColorSpace::toString(stream->colorSpace) << " to "
-			<< ColorSpace::toString(format.colorSpace);
+			<< ColorSpace::toString(oldColorSpace) << " to "
+			<< ColorSpace::toString(colorSpace);
 	}
 
 	stream->stride = format.planes[0].bpl;
