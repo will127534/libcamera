@@ -346,7 +346,18 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 		} },
                 { "imx585", {
                         .unitCellSize = { 2900, 2900 },
-                        .testPatternModes = {},
+                        /*
+                         * Maps the standard test-pattern modes onto the imx585
+                         * driver's TEST_PATTERN menu: 0 Disabled, 1 "All 000h"
+                         * (solid), 5 "Horizontal color bars". The driver's other
+                         * solids (FFFh/555h/AAAh) and vertical bars remain
+                         * reachable via the raw V4L2 control.
+                         */
+                        .testPatternModes = {
+                                { controls::draft::TestPatternModeOff, 0 },
+                                { controls::draft::TestPatternModeSolidColor, 1 },
+                                { controls::draft::TestPatternModeColorBars, 5 },
+                        },
                         .sensorDelays = {
                                 .exposureDelay = 2,
                                 .gainDelay = 2,
