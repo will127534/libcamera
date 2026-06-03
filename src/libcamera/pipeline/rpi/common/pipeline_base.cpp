@@ -575,6 +575,23 @@ int PipelineHandlerBase::configure(Camera *camera, CameraConfiguration *config)
 	for (const auto &c : result.controlInfo)
 		ctrlMap.emplace(c.first, c.second);
 
+	/*
+	 * Advertise TestPatternMode if the sensor supports any patterns. The RPi
+	 * IPA has no notion of test patterns, so the pipeline owns this control:
+	 * it is published here (from the sensor's testPatternModes map) and applied
+	 * directly to the sensor in queueRequestDevice(). The idmap below is the
+	 * global controls::controls (the IPA builds result.controlInfo with it), so
+	 * the draft control id resolves.
+	 */
+	const auto &testPatternModes = data->sensor_->testPatternModes();
+	if (!testPatternModes.empty()) {
+		std::vector<ControlValue> values;
+		values.reserve(testPatternModes.size());
+		for (auto pattern : testPatternModes)
+			values.emplace_back(pattern);
+		ctrlMap[&controls::draft::TestPatternMode] = ControlInfo(values);
+	}
+
 	const auto cropParamsIt = data->cropParams_.find(0);
 	if (cropParamsIt != data->cropParams_.end()) {
 		const CameraData::CropParams &cropParams = cropParamsIt->second;
@@ -789,6 +806,30 @@ int PipelineHandlerBase::queueRequestDevice(Camera *camera, Request *request)
 		int ret = stream->queueBuffer(buffer);
 		if (ret)
 			return ret;
+	}
+
+	/*
+	 * Apply any sensor controls the IPA does not handle. Currently just
+	 * TestPatternMode: it maps directly onto the sensor's V4L2 test-pattern
+	 * control (CameraSensorRaw + the per-sensor testPatternModes map) and the
+	 * RPi IPA has no notion of it, so the pipeline forwards it straight to the
+	 * sensor, mirroring the IPU3 handler. The application holds the mode across
+	 * frames, so applying it on queue (rather than a precise frameStart sync)
+	 * is sufficient, and the sensor's own control delay settles it.
+	 */
+	const auto &testPatternMode =
+		request->controls().get(controls::draft::TestPatternMode);
+	if (testPatternMode) {
+		int ret = data->sensor_->setTestPatternMode(
+			static_cast<controls::draft::TestPatternModeEnum>(*testPatternMode));
+		if (ret)
+			LOG(RPI, Error) << "Failed to set test pattern mode: " << ret;
+		/*
+		 * Don't echo the mode into request metadata here: tryRunPipeline()
+		 * asserts the request metadata is empty when it starts processing,
+		 * and metadata is populated at completion. Applying the control is
+		 * all that's needed for the pattern to take effect.
+		 */
 	}
 
 	/* Push the request to the back of the queue. */
