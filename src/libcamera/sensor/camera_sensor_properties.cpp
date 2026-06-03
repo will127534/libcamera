@@ -248,7 +248,21 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 		} },
                 { "imx294", {
                         .unitCellSize = { 4630, 4630 },
-                        .testPatternModes = {},
+                        /*
+                         * Maps the standard test-pattern modes onto the shared
+                         * imx29x driver's TEST_PATTERN menu: 0 Disabled, 1 "All
+                         * 0000h" (solid), 5 "Horizontal color bar", 6 "Vertical
+                         * color bar". The vertical bar has no exact standard name,
+                         * so it rides the ColorBarsFadeToGray slot to stay
+                         * reachable through libcamera. The other solids (3FFFh/
+                         * 1555h/2AAAh) remain reachable via the raw V4L2 control.
+                         */
+                        .testPatternModes = {
+                                { controls::draft::TestPatternModeOff, 0 },
+                                { controls::draft::TestPatternModeSolidColor, 1 },
+                                { controls::draft::TestPatternModeColorBars, 5 },
+                                { controls::draft::TestPatternModeColorBarsFadeToGray, 6 },
+                        },
                         .sensorDelays = {
                                 .exposureDelay = 2,
                                 .gainDelay = 2,
@@ -258,7 +272,21 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
                 } },
                 { "imx492", {
                         .unitCellSize = { 2315, 2315 },
-                        .testPatternModes = {},
+                        /*
+                         * Maps the standard test-pattern modes onto the shared
+                         * imx29x driver's TEST_PATTERN menu: 0 Disabled, 1 "All
+                         * 0000h" (solid), 5 "Horizontal color bar", 6 "Vertical
+                         * color bar". The vertical bar has no exact standard name,
+                         * so it rides the ColorBarsFadeToGray slot to stay
+                         * reachable through libcamera. The other solids (3FFFh/
+                         * 1555h/2AAAh) remain reachable via the raw V4L2 control.
+                         */
+                        .testPatternModes = {
+                                { controls::draft::TestPatternModeOff, 0 },
+                                { controls::draft::TestPatternModeSolidColor, 1 },
+                                { controls::draft::TestPatternModeColorBars, 5 },
+                                { controls::draft::TestPatternModeColorBarsFadeToGray, 6 },
+                        },
                         .sensorDelays = {
                                 .exposureDelay = 2,
                                 .gainDelay = 2,
