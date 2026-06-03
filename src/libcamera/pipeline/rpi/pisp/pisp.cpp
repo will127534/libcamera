@@ -1659,14 +1659,15 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		/* No LUT install needed — processRawStats() unwraps the buffer
 		 * in place before the stats kernel reads it. */
 	}
-	if (qbc_ || ccmpUnwrap_ || wdrActive) {
+	if (qbc_ || ccmpUnwrap_ || wdrActive || rawStats_) {
 		LOG(RPI, Info) << (qbc_           ? "QBC remosaic"
 				   : ccmpUnwrap_  ? "ClearHDR-12b CCMP stats linearisation"
-						  : "ClearHDR (WDR) — unpacked CFE")
+				   : wdrActive    ? "ClearHDR (WDR) — unpacked CFE"
+						  : "High-bit-depth SW stats — unpacked CFE")
 			       << " enabled for " << sensor_->model();
 
 		/*
-		 * Force unpacked 16-bit u16 CFE for three reasons:
+		 * Force unpacked 16-bit u16 CFE for four reasons:
 		 *   - QBC: NEON remosaic kernel does in-place u16 work.
 		 *   - CCMP stats linearisation: stats kernel indexes the LUT
 		 *     with (pixel_u16 >> 4) to get the 12-bit CCMP code; needs
@@ -1674,6 +1675,11 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		 *   - WDR without CCMP linearisation: avoids stacking PISP-COMP1
 		 *     lossy companding on top of the sensor's gradation
 		 *     compression.
+		 *   - High-bit-depth SW stats (rawStats_, e.g. IMX294 14-bit):
+		 *     processRawStats() reads the raw buffer as unpacked u16, and
+		 *     PISP-COMP1 companding is itself unreliable at >=14-bit, so
+		 *     the buffer must be plain unpacked 16-bit (stride == width*2)
+		 *     for both the SW stats kernel and the do14bitUnpack step.
 		 * Override any packed/compressed format the user or the
 		 * auto-pick chose.
 		 */
@@ -1694,14 +1700,14 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	if (ret)
 		return ret;
 
-	if ((qbc_ || ccmpUnwrap_ || wdrActive) && !rawStreams.empty()) {
+	if ((qbc_ || ccmpUnwrap_ || wdrActive || rawStats_) && !rawStreams.empty()) {
 		/*
 		 * Sync the external raw-stream config to the actual CFE format.
 		 * After setFormat the kernel has filled planes[0].size; rpicam-apps
 		 * reads cfg.frameSize to allocate the dma-heap buffer. Same
 		 * requirement whether the buffer carries QBC remosaic output,
-		 * CCMP-unwrapped data, or plain unpacked-WDR raw — they all share
-		 * the unpacked 16-bit u16 layout.
+		 * CCMP-unwrapped data, plain unpacked-WDR raw, or high-bit-depth
+		 * SW-stats raw — they all share the unpacked 16-bit u16 layout.
 		 */
 		rawStreams[0].cfg->pixelFormat = cfeFormat.fourcc.toPixelFormat();
 		rawStreams[0].cfg->stride = cfeFormat.planes[0].bpl;
