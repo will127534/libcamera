@@ -855,6 +855,19 @@ private:
 		ControlList sensorControls;
 		unsigned int delayContext;
 		std::unordered_map<const RPi::Stream *, FrameBuffer *> buffers;
+		/*
+		 * Latched once the SW stats producers (QBC remosaic / RawStats)
+		 * have run for this job. cfeBufferDequeue() is entered once per
+		 * CFE stream buffer and the Output0 + Stats pair those kernels
+		 * need is complete before the last CFE stream of the frame
+		 * (Embedded, when sensorMetadata_ is set, and the Config buffer)
+		 * dequeues. Without this latch the in-place QBC remosaic ran a
+		 * second time on its own output — remosaicing a Bayer frame as
+		 * if it were a quad, which leaves only the 4 pass-through G
+		 * outputs and the 2 exact-phase R/B corners of each 4×4 macro
+		 * intact and turns the render magenta.
+		 */
+		bool swStatsDone = false;
 	};
 
 	std::queue<CfeJob> cfeJobQueue_;
@@ -1996,16 +2009,25 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 		prepareCfe();
 	}
 
-	if (qbc_ &&
+	/*
+	 * SW stats producers. They need both the raw and the stats buffer, so
+	 * they can only run from this per-stream tail — but they must run
+	 * EXACTLY ONCE per frame: the QBC kernel rewrites the raw buffer in
+	 * place, so a second pass would remosaic its own output. job.swStatsDone
+	 * latches that for the rest of the job's dequeues.
+	 */
+	if (!job.swStatsDone &&
 	    job.buffers.count(&cfe_[Cfe::Output0]) &&
 	    job.buffers.count(&cfe_[Cfe::Stats])) {
-		processQbcFrame(job.buffers[&cfe_[Cfe::Output0]],
-				job.buffers[&cfe_[Cfe::Stats]]);
-	} else if (rawStats_ &&
-		   job.buffers.count(&cfe_[Cfe::Output0]) &&
-		   job.buffers.count(&cfe_[Cfe::Stats])) {
-		processRawStats(job.buffers[&cfe_[Cfe::Output0]],
-				job.buffers[&cfe_[Cfe::Stats]]);
+		if (qbc_) {
+			job.swStatsDone = true;
+			processQbcFrame(job.buffers[&cfe_[Cfe::Output0]],
+					job.buffers[&cfe_[Cfe::Stats]]);
+		} else if (rawStats_) {
+			job.swStatsDone = true;
+			processRawStats(job.buffers[&cfe_[Cfe::Output0]],
+					job.buffers[&cfe_[Cfe::Stats]]);
+		}
 	}
 
 	handleState();
