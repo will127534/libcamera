@@ -767,11 +767,13 @@ bilinearRowNEON(uint16_t * __restrict out,
 		neon_c0_hi = ((width - 16) / 16) * 16;
 		if (neon_c0_hi < 0) neon_c0_hi = 0;
 	} else {
-		/* B: blocks at c0 = 16, 32, ..., each accesses [c0-1..c0+15].
-		 * Need c0 >= 1 and c0+15 < width. */
+		/* B: blocks at c0 = 16, 32, ...; each gathers from
+		 * src[c0-1 .. c0+22]. The last block must therefore satisfy
+		 * c0 - 1 + 23 <= width - 1, i.e. c0 <= width - 23; the old
+		 * bound (width/16*16) let the final block's tail load run up
+		 * to 7 u16 past the end of the row. */
 		neon_c0_lo = 16;
-		neon_c0_hi = ((width / 16) * 16);
-		if (neon_c0_hi >= width) neon_c0_hi = (width / 16) * 16;
+		neon_c0_hi = width >= 39 ? ((width - 23) / 16) * 16 : neon_c0_lo;
 		if (neon_c0_hi < neon_c0_lo) neon_c0_hi = neon_c0_lo;
 	}
 
