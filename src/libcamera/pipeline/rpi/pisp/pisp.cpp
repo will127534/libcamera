@@ -1898,8 +1898,11 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 	configureEntities(rpiConfig->sensorFormat_, embeddedFormat);
 	configureCfe();
 
-	if (beEnabled_)
-		configureBe(rpiConfig->yuvColorSpace_);
+	if (beEnabled_) {
+		ret = configureBe(rpiConfig->yuvColorSpace_);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -2254,6 +2257,28 @@ int PiSPCameraData::configureBe(const std::optional<ColorSpace> &yuvColorSpace)
 	isp_[Isp::Input].dev()->getFormat(&cfeFormat);
 	inputFormat = toPiSPImageFormat(cfeFormat);
 
+	/*
+	 * The libpisp tiler splits the frame into vertical stripes no taller than
+	 * its default MaxStripeHeight (3072). When the back-end input is taller
+	 * than that (only large un-binned modes, e.g. 5456x4080 and 8192x6128,
+	 * reach this), the first stripe cannot cover the whole input, so the
+	 * aspect-ratio crop can leave a final stripe only a handful of output
+	 * rows high. If that tail falls below the hardware minimum tile height
+	 * (16) - which happens with small/preview output streams - libpisp
+	 * throws an *uncaught* std::runtime_error ("Tile height too small at
+	 * output") that aborts the entire process.
+	 *
+	 * Forcing such tall inputs into a single vertical stripe removes the tail
+	 * entirely (the whole input, and therefore any crop within it, is tiled in
+	 * one vertical pass) and lets these modes capture normally regardless of
+	 * the output size. Inputs no taller than the default stripe are already
+	 * single-stripe, so pass 0 to keep the stock behaviour for every other
+	 * sensor/mode.
+	 */
+	constexpr unsigned int DefaultMaxStripeHeight = 3072;
+	be_->SetMaxStripeHeight(cfeFormat.size.height > DefaultMaxStripeHeight ?
+					cfeFormat.size.height : 0);
+
 	pisp_be_global_config global;
 	be_->GetGlobal(global);
 	global.bayer_enables &= ~(PISP_BE_BAYER_ENABLE_DECOMPRESS +
@@ -2404,6 +2429,24 @@ int PiSPCameraData::configureBe(const std::optional<ColorSpace> &yuvColorSpace)
 
 	be_->SetGlobal(global);
 	be_->SetInputFormat(inputFormat);
+
+	/*
+	 * Defensive backstop: run the tiler once here (it is otherwise first run
+	 * per-frame, deep inside an event callback where a throw would terminate
+	 * the process). If this configuration cannot be tiled - e.g. an extreme
+	 * downscale that libpisp rejects with a runtime_error - fail the configure
+	 * cleanly with an error return instead of aborting later. The tiles it
+	 * computes here are cached and reused by the first frame, so this is not
+	 * wasted work.
+	 */
+	try {
+		be_->Prepare(nullptr);
+	} catch (const std::exception &e) {
+		LOG(RPI, Error)
+			<< "PiSP back-end cannot tile this configuration: " << e.what()
+			<< " - reduce the mode size or increase the output stream size";
+		return -EINVAL;
+	}
 
 	return 0;
 }
