@@ -643,6 +643,74 @@ wcR_B(void)
 	return vld1q_u16(v);
 }
 
+/*
+ * Column taps for one R/B output — the single source of truth for the
+ * bilinear column rule, shared by every scalar site below so the scalar
+ * head/tail and the NEON middle cannot drift apart.
+ *
+ *   pos 0 (R): sources at cols c % 4 ∈ {0, 1}, outputs at even cols.
+ *     ox % 4 == 0 → exact phase, one tap.
+ *     ox % 4 == 2 → taps ox-1 (2/3) and ox+2 (1/3).
+ *   pos 1 (B): sources at cols c % 4 ∈ {2, 3}, outputs at odd cols.
+ *     ox % 4 == 3 → exact phase, one tap.
+ *     ox % 4 == 1 → taps ox-2 (1/3) and ox+1 (2/3).
+ *
+ * The NEON middle implements exactly this rule with the constant per-lane
+ * weight vectors above (wcL_R, wcR_R, wcL_B, wcR_B) plus the TBL gather
+ * indices; its loop
+ * bounds keep the frame's first and last 16 columns in the scalar head /
+ * tail, so the edge rule below only ever executes in scalar code.
+ *
+ * Edge rule: an out-of-frame tap is MIRRORED to ox∓2, which is the same
+ * distance away and — because the QBC colour phase has period 4 — carries
+ * the same source colour. An ordinary "clamp to the nearest valid pixel"
+ * lands on the adjacent colour phase instead and bleeds Ye into the last R
+ * column and R into the first B column (a coloured 1 px frame border). The
+ * row pass already mirrors this way at the top and bottom macro rows
+ * (prev_row3 → this_row3, next_row0 → this_row0), so rows and columns now
+ * follow one rule.
+ */
+struct RbTaps {
+	int cs_l, cs_r;
+	uint16_t wc_l_q, wc_r_q;
+};
+
+static inline RbTaps rbColTaps(int ox, int pos, int width)
+{
+	RbTaps t;
+	if (pos == 0) {
+		if ((ox & 3) == 0)
+			t = { ox, ox, Q15_ONE, Q15_ZERO };
+		else
+			t = { ox - 1, ox + 2, Q15_TWO_THIRDS, Q15_ONE_THIRD };
+	} else {
+		if ((ox & 3) == 3)
+			t = { ox, ox, Q15_ONE, Q15_ZERO };
+		else
+			t = { ox - 2, ox + 1, Q15_ONE_THIRD, Q15_TWO_THIRDS };
+	}
+
+	/* Same-colour, same-phase mirror at the frame edges. */
+	if (t.cs_r >= width)
+		t.cs_r = ox - 2;
+	if (t.cs_l < 0)
+		t.cs_l = ox + 2;
+
+	/* Degenerate geometry (frames narrower than one macro): keep the
+	 * in-frame tap and drop the other rather than read out of bounds. */
+	if (t.cs_r < 0 || t.cs_r >= width) {
+		t.cs_r = t.cs_l;
+		t.wc_l_q = Q15_ONE;
+		t.wc_r_q = Q15_ZERO;
+	}
+	if (t.cs_l < 0 || t.cs_l >= width) {
+		t.cs_l = t.cs_r;
+		t.wc_l_q = Q15_ZERO;
+		t.wc_r_q = Q15_ONE;
+	}
+	return t;
+}
+
 } /* anonymous namespace */
 
 /*
@@ -690,8 +758,11 @@ bilinearRowNEON(uint16_t * __restrict out,
 
 	int neon_c0_lo, neon_c0_hi;
 	if (pos == 0) {
-		/* R: blocks at c0 = 0, 16, 32, ..., each accesses [c0..c0+16].
-		 * Last block may read row[c0+16] — only safe if c0+16 < width. */
+		/* R: blocks at c0 = 0, 16, 32, ...; each gathers from
+		 * src[c0 .. c0+23] (the third vld1q_u16 loads 8 lanes of which
+		 * only lane 0 — rel index 16 — is used), and the last 16
+		 * columns are left to the scalar tail so the right-edge tap
+		 * rule lives in one place. */
 		neon_c0_lo = 0;
 		neon_c0_hi = ((width - 16) / 16) * 16;
 		if (neon_c0_hi < 0) neon_c0_hi = 0;
@@ -710,11 +781,8 @@ bilinearRowNEON(uint16_t * __restrict out,
 		 * frame is too small for any NEON block. */
 		if (neon_c0_hi == 0) {
 			for (int ox = 0; ox < width; ox += 2) {
-				int cs_l, cs_r;
-				uint16_t wc_l_q, wc_r_q;
-				if ((ox & 3) == 0) { cs_l = cs_r = ox; wc_l_q = Q15_ONE; wc_r_q = Q15_ZERO; }
-				else { cs_l = ox - 1; cs_r = ox + 2; wc_l_q = Q15_TWO_THIRDS; wc_r_q = Q15_ONE_THIRD; }
-				out[ox] = bilerp1(cs_l, cs_r, wc_l_q, wc_r_q);
+				RbTaps t = rbColTaps(ox, 0, width);
+				out[ox] = bilerp1(t.cs_l, t.cs_r, t.wc_l_q, t.wc_r_q);
 			}
 			return;
 		}
@@ -722,11 +790,8 @@ bilinearRowNEON(uint16_t * __restrict out,
 		/* For B: scalar cover ox = 1, 3, 5, ..., neon_c0_lo-1 (= 15). */
 		for (int ox = 1; ox < neon_c0_lo + 1; ox += 2) {
 			if (ox >= width) break;
-			int cs_l, cs_r;
-			uint16_t wc_l_q, wc_r_q;
-			if ((ox & 3) == 3) { cs_l = cs_r = ox; wc_l_q = Q15_ONE; wc_r_q = Q15_ZERO; }
-			else { cs_l = ox - 2; cs_r = ox + 1; wc_l_q = Q15_ONE_THIRD; wc_r_q = Q15_TWO_THIRDS; }
-			out[ox] = bilerp1(cs_l, cs_r, wc_l_q, wc_r_q);
+			RbTaps t = rbColTaps(ox, 1, width);
+			out[ox] = bilerp1(t.cs_l, t.cs_r, t.wc_l_q, t.wc_r_q);
 		}
 	}
 
@@ -790,20 +855,14 @@ bilinearRowNEON(uint16_t * __restrict out,
 	/* ---- Tail scalar ---- */
 	if (pos == 0) {
 		for (int ox = neon_c0_hi; ox < width; ox += 2) {
-			int cs_l, cs_r;
-			uint16_t wc_l_q, wc_r_q;
-			if ((ox & 3) == 0) { cs_l = cs_r = ox; wc_l_q = Q15_ONE; wc_r_q = Q15_ZERO; }
-			else { cs_l = ox - 1; cs_r = ox + 2; wc_l_q = Q15_TWO_THIRDS; wc_r_q = Q15_ONE_THIRD; }
-			out[ox] = bilerp1(cs_l, cs_r, wc_l_q, wc_r_q);
+			RbTaps t = rbColTaps(ox, 0, width);
+			out[ox] = bilerp1(t.cs_l, t.cs_r, t.wc_l_q, t.wc_r_q);
 		}
 	} else {
 		int ox_start = neon_c0_hi + 1;
 		for (int ox = ox_start; ox < width; ox += 2) {
-			int cs_l, cs_r;
-			uint16_t wc_l_q, wc_r_q;
-			if ((ox & 3) == 3) { cs_l = cs_r = ox; wc_l_q = Q15_ONE; wc_r_q = Q15_ZERO; }
-			else { cs_l = ox - 2; cs_r = ox + 1; wc_l_q = Q15_ONE_THIRD; wc_r_q = Q15_TWO_THIRDS; }
-			out[ox] = bilerp1(cs_l, cs_r, wc_l_q, wc_r_q);
+			RbTaps t = rbColTaps(ox, 1, width);
+			out[ox] = bilerp1(t.cs_l, t.cs_r, t.wc_l_q, t.wc_r_q);
 		}
 	}
 }
@@ -812,7 +871,16 @@ bilinearRowNEON(uint16_t * __restrict out,
 			       unsigned int width, unsigned int height,
 			       unsigned int strideU16)
 {
+	/*
+	 * Same-colour, same-phase row mirror — the row-axis twin of
+	 * rbColTaps()'s column rule (and of what bilinearMacroRow() does at
+	 * the top / bottom macro row). A row tap that falls outside the frame
+	 * is reflected to oy∓2, never clamped to the nearest line, which would
+	 * be a different colour phase.
+	 */
 	auto src_row = [&](int r) -> const uint16_t * {
+		if (r < 0) r += 4;
+		else if (r >= static_cast<int>(height)) r -= 4;
 		if (r < 0) r = 0;
 		else if (r >= static_cast<int>(height)) r = height - 1;
 		return src + static_cast<unsigned>(r) * strideU16;
