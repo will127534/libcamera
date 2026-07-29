@@ -385,6 +385,22 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
                                 .hblankDelay = 2
                         },
                 } },
+		{ "imx700", {
+			.unitCellSize = { 1220, 1220 },
+			.testPatternModes = {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeSolidColor, 1 },
+				{ controls::draft::TestPatternModeColorBars, 2 },
+				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
+				{ controls::draft::TestPatternModePn9, 4 },
+			},
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 3,
+				.hblankDelay = 3
+			},
+		} },
 		{ "imx708", {
 			.unitCellSize = { 1400, 1400 },
 			.testPatternModes = {
