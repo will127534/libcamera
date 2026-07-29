@@ -2859,10 +2859,34 @@ void PiSPCameraData::processQbcFrame(FrameBuffer *raw, FrameBuffer *stats)
 
 	updateSensorBlackLevel();
 
+	/*
+	 * DIAGNOSTIC KNOB (LIBCAMERA_RPI_QBC_BYPASS=1): snapshot the raw buffer
+	 * before the in-place remosaic and put it back afterwards, so an
+	 * on-device `--raw` capture yields the native 4x4 Quad-Bayer exactly as
+	 * the CFE delivered it — the only way to observe the un-remosaic'd quad
+	 * in the pipeline's own numeric domain (unpacked u16, post any in-place
+	 * unpack/endian fixes). Used for calibrating/verifying per-sub-pixel
+	 * corrections against real frames. The SW stats are still produced
+	 * normally (the kernel runs in full), but the BE then demosaics a quad,
+	 * so the RENDERED image is meaningless in this mode — diagnostics only.
+	 */
+	static const bool qbcBypass = [] {
+		const char *e = utils::secure_getenv("LIBCAMERA_RPI_QBC_BYPASS");
+		return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' ||
+			     e[0] == 'y' || e[0] == 'Y');
+	}();
+
 	dmabufSyncStart(raw->planes()[0].fd);
 	dmabufSyncStart(stats->planes()[0].fd);
 
+	std::vector<uint16_t> quadSnapshot;
+	if (qbcBypass)
+		quadSnapshot.assign(rawPx, rawPx + static_cast<size_t>(stride / 2) * height);
+
 	qbc_->process(rawPx, st, width, height, stride);
+
+	if (qbcBypass)
+		std::copy(quadSnapshot.begin(), quadSnapshot.end(), rawPx);
 
 	dmabufSyncEnd(stats->planes()[0].fd);
 	dmabufSyncEnd(raw->planes()[0].fd);
