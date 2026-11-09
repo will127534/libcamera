@@ -5,7 +5,7 @@
         {
             "rpi.black_level":
             {
-                "black_level": 800
+                "black_level": 2048
             }
         },
         {
@@ -130,6 +130,7 @@
         {
             "rpi.agc":
             {
+                "startup_frames": 0,
                 "metering_modes":
                 {
                     "centre-weighted":
