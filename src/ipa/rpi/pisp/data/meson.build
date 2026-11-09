@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: CC0-1.0
 
 conf_files = files([
+    'imx06a.json',
     'imx219.json',
     'imx219_noir.json',
     'imx283.json',
