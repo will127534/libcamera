@@ -134,8 +134,17 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 		} },
 		{ "gmax3412", {
 			.unitCellSize = { 3400, 3400 },
-                        .testPatternModes = {},
-                        .sensorDelays = {},
+			.testPatternModes = {},
+			/* Verified by framedelay_qa: gain/exposure metadata land on
+			 * the same frame as the actual luma change (gainDelay 1,
+			 * exposureDelay 2). These match libcamera's defaults but are
+			 * now explicit, so the "unverified defaults" warning is gone. */
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 1,
+				.vblankDelay = 2,
+				.hblankDelay = 2,
+			},
 		} },
 		{ "hi846", {
 			.unitCellSize = { 1120, 1120 },
