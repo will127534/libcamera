@@ -197,6 +197,26 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
 				.hblankDelay = 2
 			},
 		} },
+		{ "imx06a", {
+			.unitCellSize = { 1600, 1600 },
+			.testPatternModes = {
+				{ controls::draft::TestPatternModeOff, 0 },
+				{ controls::draft::TestPatternModeSolidColor, 1 },
+				{ controls::draft::TestPatternModeColorBars, 2 },
+				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
+				{ controls::draft::TestPatternModePn9, 4 },
+			},
+			/*
+			 * SRM 7.3: CIT and gain both land on the 2nd frame after
+			 * the write; FRM_LENGTH reflects at 2V (0x3020 default).
+			 */
+			.sensorDelays = {
+				.exposureDelay = 2,
+				.gainDelay = 2,
+				.vblankDelay = 3,
+				.hblankDelay = 3
+			},
+		} },
 		{ "imx214", {
 			.unitCellSize = { 1120, 1120 },
 			.testPatternModes = {
