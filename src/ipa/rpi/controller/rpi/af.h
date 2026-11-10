@@ -104,6 +104,7 @@ private:
 		uint32_t stepFrames;		/* frames to skip in between steps of a scan */
 		uint32_t pdafSettleFrames;	/* frames to ignore PDAF after a lens move */
 		double pdafSettlePerDioptre;	/* extra frames per dioptre moved */
+		bool pdafGainAdapt;		/* measure phase per dioptre after each move */
 
 		SpeedDependentParams();
 		void read(const libcamera::ValueNode &params);
@@ -147,6 +148,7 @@ private:
 	double getContrast(const FocusRegions &focusStats);
 	bool getAverageAndTestIr(const RgbyRegions &awbStats, double rgb[3]);
 	void doPDAF(double phase, double conf);
+	void adaptPdafGain(double phase, double conf);
 	bool earlyTerminationByPhase(double phase);
 	double findPeak(unsigned index) const;
 	void doScan(double contrast, double phase, double conf);
@@ -177,6 +179,9 @@ private:
 	double prevAverage_[3], oldSceneAverage_[3];
 	double prevPhase_;
 	unsigned skipCount_, stepCount_, dropCount_, settleCount_;
+	/* PDAF gain adaptation: the last move, and the measured gain correction */
+	double moveFrom_, movePhase_, moveConf_, gainScale_;
+	bool moveValid_;
 	unsigned sameSignCount_;
 	unsigned sceneChangeCount_;
 	unsigned scanMaxIndex_;
