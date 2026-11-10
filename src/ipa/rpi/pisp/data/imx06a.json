@@ -3640,6 +3640,41 @@
             }
         },
         {
+            "rpi.af": {
+                "ranges": {
+                    "normal": {
+                        "min": 0.0,
+                        "max": 6.25,
+                        "default": 1.0
+                    }
+                },
+                "speeds": {
+                    "normal": {
+                        "step_coarse": 0.5,
+                        "step_fine": 0.15,
+                        "contrast_ratio": 0.75,
+                        "retrigger_ratio": 0.8,
+                        "retrigger_delay": 10,
+                        "pdaf_gain": -0.031,
+                        "pdaf_squelch": 0.04,
+                        "max_slew": 3.0,
+                        "pdaf_frames": 45,
+                        "dropout_frames": 6,
+                        "step_frames": 4,
+                        "pdaf_settle_frames": 3,
+                        "pdaf_settle_per_dioptre": 2.0,
+                        "pdaf_gain_adapt": true
+                    }
+                },
+                "conf_epsilon": 8,
+                "conf_thresh": 16,
+                "conf_clip": 512,
+                "skip_frames": 5,
+                "check_for_ir": false,
+                "map": [ 0.0, 1816, 0.158, 1754, 0.613, 1670, 1.04, 1593, 1.45, 1517, 1.96, 1432, 2.44, 1328, 2.86, 1229, 3.33, 1103, 4.0, 928, 4.55, 767, 5.0, 592, 5.56, 417, 5.88, 256, 6.25, 0 ]
+            }
+        },
+        {
             "rpi.sync": {}
         }
     ]
