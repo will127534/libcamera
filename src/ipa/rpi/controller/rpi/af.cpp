@@ -55,7 +55,8 @@ Af::SpeedDependentParams::SpeedDependentParams()
 	  dropoutFrames(6),
 	  stepFrames(4),
 	  pdafSettleFrames(0),
-	  pdafSettlePerDioptre(0.0)
+	  pdafSettlePerDioptre(0.0),
+	  pdafGainAdapt(false)
 {
 }
 
@@ -112,6 +113,14 @@ void Af::SpeedDependentParams::read(const libcamera::ValueNode &params)
 		pdafSettleFrames = *v;
 	if (auto v = params["pdaf_settle_per_dioptre"].get<double>())
 		pdafSettlePerDioptre = *v;
+	/*
+	 * Optional, with settling: measure the phase change per dioptre over
+	 * each settled move and scale pdaf_gain to match. Phase per dioptre
+	 * depends on the lens and its aperture (wider aperture, more phase),
+	 * which an interchangeable lens may change at any time.
+	 */
+	if (auto v = params["pdaf_gain_adapt"].get<bool>())
+		pdafGainAdapt = *v;
 }
 
 int Af::CfgParams::read(const libcamera::ValueNode &params)
@@ -211,6 +220,11 @@ Af::Af(Controller *controller)
 	  stepCount_(0),
 	  dropCount_(0),
 	  settleCount_(0),
+	  moveFrom_(0.0),
+	  movePhase_(0.0),
+	  moveConf_(0.0),
+	  gainScale_(1.0),
+	  moveValid_(false),
 	  sameSignCount_(0),
 	  sceneChangeCount_(0),
 	  scanMaxContrast_(0.0),
@@ -445,10 +459,42 @@ bool Af::getAverageAndTestIr(const RgbyRegions &awbStats, double rgb[3])
 		4 * sb < 5 * sg && 4 * sg < 5 * sb);
 }
 
+/*
+ * After a settled PDAF move: the phase changed by (phase - movePhase_) while
+ * the lens moved by (fsmooth_ - moveFrom_) dioptres. Compare that slope with
+ * the one pdaf_gain assumes and correct the gain, mostly trusting the new
+ * measurement. Implausible slopes (too small a move, scene change, wrong
+ * sign) are ignored.
+ *
+ * Far out of focus the phase reads low, which looks like a shallow slope and
+ * would raise the gain, so raising it needs two confident phases. Lowering
+ * it is always safe and needs only usable ones: a gain more than twice too
+ * high makes the lens overshoot back and forth, and the phases seen while it
+ * does so (a window spanning two depths, say) may never be confident enough
+ * for the stricter test.
+ */
+void Af::adaptPdafGain(double phase, double conf)
+{
+	const double move = fsmooth_ - moveFrom_;
+	const double nominal = -1.0 / cfg_.speeds[speed_].pdafGain;
+	const double minConf = std::min(conf, moveConf_);
+
+	if (std::abs(move) < 0.25 || nominal == 0.0 || minConf < 0.25 * cfg_.confClip)
+		return;
+	const double ratio = (phase - movePhase_) / move / nominal;
+	if (ratio < 0.2 || ratio > 8.0)
+		return;
+	if (minConf < 0.75 * cfg_.confClip && 1.0 / ratio >= gainScale_)
+		return;
+	gainScale_ = std::clamp(0.2 * gainScale_ + 0.8 / ratio, 0.125, 4.0);
+	LOG(RPiAf, Debug) << "PDAF gain: measured " << ratio << "x nominal over "
+			  << move << " D, gain scale now " << gainScale_;
+}
+
 void Af::doPDAF(double phase, double conf)
 {
 	/* Apply loop gain */
-	phase *= cfg_.speeds[speed_].pdafGain;
+	phase *= cfg_.speeds[speed_].pdafGain * gainScale_;
 
 	if (mode_ == AfModeContinuous) {
 		/*
@@ -634,11 +680,20 @@ void Af::doAF(double contrast, double phase, double conf)
 			} else if (mode_ == AfModeAuto || sameSignCount_ >= 3) {
 				const SpeedDependentParams &sp = cfg_.speeds[speed_];
 
+				if (sp.pdafGainAdapt && moveValid_)
+					adaptPdafGain(phase, conf);
+				moveValid_ = false;
+				moveFrom_ = fsmooth_;
+				movePhase_ = phase;
+				moveConf_ = conf;
+
 				doPDAF(phase, conf);
 				const double move = std::abs(ftarget_ - fsmooth_);
-				if (sp.pdafSettleFrames && move > 0.5 * sp.pdafSquelch)
+				if (sp.pdafSettleFrames && move > 0.5 * sp.pdafSquelch) {
 					settleCount_ = sp.pdafSettleFrames +
 						       std::lround(move * sp.pdafSettlePerDioptre);
+					moveValid_ = true;
+				}
 			}
 			if (stepCount_ > 0)
 				stepCount_--;
