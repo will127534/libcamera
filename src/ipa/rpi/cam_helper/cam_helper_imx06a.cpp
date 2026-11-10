@@ -78,6 +78,7 @@ private:
 
 	bool pdGeometry(PdGeom &g) const;
 	bool computePdaf(const std::vector<uint8_t> &buffer, const PdGeom &g, PdafRegions &regions);
+	void makePdafImage(const PdGeom &g, const libcamera::Rectangle *window, PdafImage &image) const;
 
 	/* PDAF grid: the same as the IMX708's on-chip grid. */
 	static constexpr unsigned int pdafCols = 16;
@@ -92,6 +93,7 @@ private:
 	std::chrono::steady_clock::time_point pdLastTime_;
 	bool pdHaveLast_ = false;
 	unsigned int pdLastKey_ = 0;		/* sites x rows of the cached grid's mode */
+	std::chrono::steady_clock::time_point pdImageTime_;
 	unsigned int pdWarned_ = 0;
 	unsigned int pdFrames_ = 0;
 
@@ -326,6 +328,23 @@ void CamHelperImx06a::prepare(Span<const uint8_t> buffer, Metadata &metadata)
 			<< " us, compute " << std::chrono::duration_cast<microseconds>(t2 - t1).count()
 			<< " us";
 	}
+
+	/*
+	 * Raw L/R images for applications that ask (rpi::PdafOutputEnable):
+	 * a window (small) up to 25 Hz, the whole field up to 10 Hz.
+	 */
+	bool imageRequest = false;
+	libcamera::Rectangle window;
+	const bool haveWindow = !metadata.get("pdaf.image_window", window);
+	if (!metadata.get("pdaf.image_request", imageRequest) && imageRequest &&
+	    t0 - pdImageTime_ >= std::chrono::milliseconds(haveWindow ? 40 : 100)) {
+		PdafImage image;
+		makePdafImage(g, haveWindow ? &window : nullptr, image);
+		if (haveWindow)
+			image.window = window;
+		metadata.set("pdaf.image", std::move(image));
+		pdImageTime_ = t0;
+	}
 }
 
 /*
@@ -512,6 +531,94 @@ bool CamHelperImx06a::computePdaf(const std::vector<uint8_t> &buffer, const PdGe
 	}
 
 	return true;
+}
+
+/*
+ * The left and right photodiode images for display: the whole field at most
+ * 400 samples wide with square samples (several PD sites x PD rows summed), or
+ * a window (ScalerCrop coordinates) at the native PD sampling, one sample per
+ * site and PD row (decimated only beyond 512 x 256). Black removed, both planes
+ * scaled by one factor (99.5th percentile = 255) to 8 bits.
+ */
+void CamHelperImx06a::makePdafImage(const PdGeom &g, const libcamera::Rectangle *window,
+				    PdafImage &image) const
+{
+	unsigned int x0 = 0, x1 = g.sites, y0 = 0, y1 = g.rows, dx, dy;
+
+	if (window) {
+		/* sensor -> mode output pixels -> PD sites (x) and PD rows (4 lines, y) */
+		const double outPerSite = static_cast<double>(mode_.width) / g.sites;
+		auto site = [&](double x) {
+			return (x - mode_.cropX) / mode_.scaleX / outPerSite;
+		};
+		auto row = [&](double y) {
+			return (y - mode_.cropY) / mode_.scaleY / 4.0;
+		};
+		auto clampTo = [](double v, unsigned int lo, unsigned int hi) {
+			return static_cast<unsigned int>(std::clamp(v, static_cast<double>(lo),
+								    static_cast<double>(hi)));
+		};
+		x0 = clampTo(std::floor(site(window->x)), 0, g.sites - 1);
+		x1 = clampTo(std::ceil(site(window->x + static_cast<double>(window->width))), x0 + 1, g.sites);
+		y0 = clampTo(std::floor(row(window->y)), 0, g.rows - 1);
+		y1 = clampTo(std::ceil(row(window->y + static_cast<double>(window->height))), y0 + 1, g.rows);
+		dx = (x1 - x0 + 511) / 512;
+		dy = (y1 - y0 + 255) / 256;
+	} else {
+		dx = (g.sites + 399) / 400;
+		/* square samples: the output aspect is the image's */
+		const unsigned int w = g.sites / dx;
+		const unsigned int hTarget = std::max(1u, static_cast<unsigned int>(
+			std::lround(static_cast<double>(w) * mode_.height / mode_.width)));
+		dy = std::max(1u, g.rows / hTarget);
+	}
+	const unsigned int w = (x1 - x0) / dx;
+	const unsigned int h = (y1 - y0) / dy;
+	const size_t rowBytes = static_cast<size_t>(g.px) * 10 / 8;
+	std::vector<int32_t> acc(2 * static_cast<size_t>(w) * h, 0);
+	const unsigned int xEnd = x0 + w * dx;
+
+	for (unsigned int r = y0; r < y0 + h * dy; r++) {
+		const uint8_t *row = pdRaw_.data() + r * rowBytes;
+		int32_t *l = &acc[static_cast<size_t>((r - y0) / dy) * w];
+		int32_t *rt = l + static_cast<size_t>(w) * h;
+		/* one 5-byte group = L R L R = sites 2i and 2i + 1 */
+		for (unsigned int i = x0 / 2; 2 * i < xEnd; i++) {
+			const uint8_t *p = row + 5 * i;
+			const unsigned int lo = p[4];
+			const unsigned int sa = 2 * i, sb = 2 * i + 1;
+			if (sa >= x0 && sa < xEnd) {
+				l[(sa - x0) / dx] += (p[0] << 2) | (lo & 3);
+				rt[(sa - x0) / dx] += (p[1] << 2) | ((lo >> 2) & 3);
+			}
+			if (sb >= x0 && sb < xEnd) {
+				l[(sb - x0) / dx] += (p[2] << 2) | ((lo >> 4) & 3);
+				rt[(sb - x0) / dx] += (p[3] << 2) | (lo >> 6);
+			}
+		}
+	}
+
+	const int black = pdBlack * static_cast<int>(dx * dy);
+	int peak = 1;
+	for (int32_t &v : acc) {
+		v = std::max(v - black, 0);
+		peak = std::max(peak, v);
+	}
+	/* 99.5th percentile from a histogram, so a few highlights do not set the scale */
+	std::vector<unsigned int> hist(1024, 0);
+	for (int32_t v : acc)
+		hist[static_cast<int64_t>(v) * 1023 / peak]++;
+	size_t count = 0, target = acc.size() * 995 / 1000;
+	unsigned int bin = 0;
+	while (bin < 1023 && (count += hist[bin]) < target)
+		bin++;
+	peak = std::max(1, static_cast<int>(static_cast<int64_t>(peak) * (bin + 1) / 1024));
+
+	image.width = w;
+	image.height = h;
+	image.data.resize(acc.size());
+	for (size_t i = 0; i < acc.size(); i++)
+		image.data[i] = static_cast<uint8_t>(std::min<int64_t>(255, static_cast<int64_t>(acc[i]) * 255 / peak));
 }
 
 static CamHelper *create()
