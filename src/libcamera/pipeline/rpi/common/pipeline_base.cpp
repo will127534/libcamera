@@ -891,6 +891,16 @@ int PipelineHandlerBase::registerCamera(std::unique_ptr<RPi::CameraData> &camera
 	data->delayedCtrls_ = std::make_unique<RPi::DelayedControls>(data->sensor_->device(), params);
 	data->sensorMetadata_ = result.sensorConfig.sensorMetadata;
 
+	/*
+	 * Some sensors expose their metadata stream (embedded data, phase
+	 * detect data) only when the driver is configured for it. Use it only
+	 * if the sensor has a metadata source pad.
+	 */
+	if (data->sensorMetadata_ && sensorEntity->pads().size() < 2) {
+		LOG(RPI, Info) << "Sensor has no metadata pad, not using sensor metadata";
+		data->sensorMetadata_ = false;
+	}
+
 	/* Register initial controls that the Raspberry Pi IPA can handle. */
 	data->controlInfo_ = std::move(result.controlInfo);
 
