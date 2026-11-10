@@ -332,4 +332,49 @@ controls:
 
         \sa PdafGrid PdafPhase
 
+  - PdafOutputEnable:
+      type: bool
+      direction: inout
+      description: |
+        Toggles the output of the raw phase-detect images in PdafImage, for
+        sensors whose camera helper computes the phase from raw left/right
+        photodiode data.
+
+        \sa PdafImage
+
+  - PdafImageWindow:
+      type: Rectangle
+      direction: inout
+      description: |
+        Region of the image, in the coordinates of ScalerCrop, for PdafImage.
+        When set to a non-empty rectangle, PdafImage covers only that region at
+        the phase-detect data's native sampling (one sample per left/right
+        site and phase-detect row, decimated only if the region exceeds 512 x
+        256 samples). An empty rectangle (the default) gives the whole field,
+        downscaled. Reported in the Request metadata with each PdafImage: the
+        region that image shows.
+
+        \sa PdafImage
+
+  - PdafImage:
+      type: uint8_t
+      size: [n]
+      direction: out
+      description: |
+        The left and right photodiode images of the phase-detect data, for
+        display: the left plane followed by the right plane, 8 bits per sample,
+        each PdafImageSize, scaled together. The whole field downscaled, or the
+        PdafImageWindow region. Sent in the Request metadata (at a reduced
+        rate) when PdafOutputEnable is true.
+
+        \sa PdafOutputEnable PdafImageSize PdafImageWindow
+
+  - PdafImageSize:
+      type: Size
+      direction: out
+      description: |
+        Size of each plane in PdafImage.
+
+        \sa PdafImage
+
 ...

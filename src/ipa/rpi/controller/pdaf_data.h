@@ -7,6 +7,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <vector>
+
+#include <libcamera/geometry.h>
 
 #include "region_stats.h"
 
@@ -20,5 +23,18 @@ struct PdafData {
 };
 
 using PdafRegions = RegionStats<PdafData>;
+
+/*
+ * Raw left/right phase-detect images for display (rpi::PdafImage), produced by
+ * camera helpers that compute the phase themselves.
+ */
+struct PdafImage {
+	unsigned int width;
+	unsigned int height;
+	/* The rpi::PdafImageWindow region shown; empty for the whole field. */
+	libcamera::Rectangle window;
+	/* Left plane then right plane, 8 bits per sample. */
+	std::vector<uint8_t> data;
+};
 
 } /* namespace RPiController */

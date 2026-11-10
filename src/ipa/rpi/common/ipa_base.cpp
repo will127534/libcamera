@@ -85,6 +85,9 @@ const ControlInfoMap::Map ipaControls{
 						static_cast<int64_t>(defaultMinFrameDuration.get<std::micro>()) } }) },
 	{ &controls::draft::NoiseReductionMode, ControlInfo(controls::draft::NoiseReductionModeValues) },
 	{ &controls::rpi::StatsOutputEnable, ControlInfo(false, true, false) },
+	{ &controls::rpi::PdafOutputEnable, ControlInfo(false, true, false) },
+	{ &controls::rpi::PdafImageWindow,
+	  ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) },
 	{ &controls::rpi::CnnEnableInputTensor, ControlInfo(false, true, false) },
 	{ &controls::rpi::SyncMode,
 	  ControlInfo({ { ControlValue(controls::rpi::SyncModeOff),
@@ -466,6 +469,13 @@ void IpaBase::prepareIsp(const PrepareParams &params)
 		rpiMetadata.set("agc.delayed_status", agcStatus);
 		hdrChange = agcStatus.hdr.mode != hdrStatus_.mode;
 		hdrStatus_ = agcStatus.hdr;
+	}
+
+	/* Ask the helper for raw PDAF images too, if the application wants them. */
+	if (pdafImageOutput_) {
+		rpiMetadata.set("pdaf.image_request", true);
+		if (!pdafImageWindow_.isNull())
+			rpiMetadata.set("pdaf.image_window", pdafImageWindow_);
 	}
 
 	/*
@@ -1481,6 +1491,14 @@ void IpaBase::applyControls(const ControlList &controls)
 			statsMetadataOutput_ = ctrl.second.get<bool>();
 			break;
 
+		case controls::rpi::PDAF_OUTPUT_ENABLE:
+			pdafImageOutput_ = ctrl.second.get<bool>();
+			break;
+
+		case controls::rpi::PDAF_IMAGE_WINDOW:
+			pdafImageWindow_ = ctrl.second.get<Rectangle>();
+			break;
+
 		case controls::rpi::CNN_ENABLE_INPUT_TENSOR:
 			cnnEnableInputTensor_ = ctrl.second.get<bool>();
 			break;
@@ -1600,6 +1618,15 @@ void IpaBase::reportMetadata(unsigned int ipaContext)
 		libcameraMetadata_.set(controls::rpi::PdafGrid, pdaf->size());
 		libcameraMetadata_.set(controls::rpi::PdafPhase, phase);
 		libcameraMetadata_.set(controls::rpi::PdafConfidence, conf);
+	}
+
+	RPiController::PdafImage *pdafImage =
+		rpiMetadata.getLocked<RPiController::PdafImage>("pdaf.image");
+	if (pdafImage && pdafImageOutput_) {
+		libcameraMetadata_.set(controls::rpi::PdafImageSize,
+				       Size(pdafImage->width, pdafImage->height));
+		libcameraMetadata_.set(controls::rpi::PdafImage, Span<const uint8_t>(pdafImage->data));
+		libcameraMetadata_.set(controls::rpi::PdafImageWindow, pdafImage->window);
 	}
 
 	AgcPrepareStatus *agcPrepareStatus = rpiMetadata.getLocked<AgcPrepareStatus>("agc.prepare_status");
