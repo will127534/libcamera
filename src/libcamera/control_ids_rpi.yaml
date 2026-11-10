@@ -377,4 +377,24 @@ controls:
 
         \sa PdafImage
 
+  - SensorMetadataDump:
+      type: string
+      direction: in
+      description: |
+        Path of a file to which the IPA appends, for every frame, the raw
+        sensor metadata buffer it receives (embedded data or, for sensors
+        that send it there, raw phase-detect data), each preceded by a
+        64-byte little-endian header:
+
+        - char magic[4] = "SMDR", uint32 header size (64), uint32 payload
+          size, uint32 frame count since the dump started
+        - int64 SensorTimestamp (ns, as in the Request metadata)
+        - uint16 mode width, height, bit depth, binning X; float scale X,
+          scale Y (the camera mode the frame was captured in)
+        - float exposure (us), analogue gain, lens position (dioptres, NaN
+          if unknown), uint32 reserved x3
+
+        An empty string closes the file. Debugging and data collection aid:
+        the data rate can be high (e.g. 4 MB per frame).
+
 ...
