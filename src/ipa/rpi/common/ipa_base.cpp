@@ -9,6 +9,8 @@
 
 #include <array>
 #include <cmath>
+#include <stdio.h>
+#include <string.h>
 
 #include <libcamera/base/log.h>
 #include <libcamera/base/span.h>
@@ -88,6 +90,7 @@ const ControlInfoMap::Map ipaControls{
 	{ &controls::rpi::PdafOutputEnable, ControlInfo(false, true, false) },
 	{ &controls::rpi::PdafImageWindow,
 	  ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535), Rectangle{}) },
+	{ &controls::rpi::SensorMetadataDump, ControlInfo(0, 4096) },
 	{ &controls::rpi::CnnEnableInputTensor, ControlInfo(false, true, false) },
 	{ &controls::rpi::SyncMode,
 	  ControlInfo({ { ControlValue(controls::rpi::SyncModeOff),
@@ -141,6 +144,8 @@ IpaBase::IpaBase()
 
 IpaBase::~IpaBase()
 {
+	if (metadataDump_)
+		fclose(metadataDump_);
 }
 
 int32_t IpaBase::init(const IPASettings &settings, const InitParams &params, InitResult *result)
@@ -471,6 +476,9 @@ void IpaBase::prepareIsp(const PrepareParams &params)
 		hdrChange = agcStatus.hdr.mode != hdrStatus_.mode;
 		hdrStatus_ = agcStatus.hdr;
 	}
+
+	if (metadataDump_ && !embeddedBuffer.empty())
+		dumpSensorMetadata(embeddedBuffer, frameTimestamp, rpiMetadata);
 
 	/* Ask the helper for raw PDAF images too, if the application wants them. */
 	if (pdafImageOutput_) {
@@ -1513,6 +1521,20 @@ void IpaBase::applyControls(const ControlList &controls)
 			pdafImageWindow_ = ctrl.second.get<Rectangle>();
 			break;
 
+		case controls::rpi::SENSOR_METADATA_DUMP: {
+			const std::string path(ctrl.second.get<std::string_view>());
+
+			if (metadataDump_)
+				fclose(metadataDump_);
+			metadataDump_ = path.empty() ? nullptr : fopen(path.c_str(), "ab");
+			metadataDumpFrames_ = 0;
+			if (!path.empty() && !metadataDump_)
+				LOG(IPARPI, Error) << "Cannot open sensor metadata dump " << path;
+			else if (!path.empty())
+				LOG(IPARPI, Info) << "Dumping sensor metadata to " << path;
+			break;
+		}
+
 		case controls::rpi::CNN_ENABLE_INPUT_TENSOR:
 			cnnEnableInputTensor_ = ctrl.second.get<bool>();
 			break;
@@ -1593,6 +1615,52 @@ void IpaBase::fillSyncParams(const PrepareParams &params, unsigned int ipaContex
 	syncParams.wallClock = *params.sensorControls.get(controls::FrameWallClock);
 	syncParams.sensorTimestamp = *params.sensorControls.get(controls::SensorTimestamp);
 	rpiMetadata_[ipaContext].set("sync.params", syncParams);
+}
+
+/*
+ * rpi::SensorMetadataDump: append the raw sensor metadata buffer of this frame
+ * to the dump file, after a 64-byte header (see the control's description).
+ */
+void IpaBase::dumpSensorMetadata(Span<const uint8_t> buffer, int64_t timestamp,
+				 const RPiController::Metadata &metadata)
+{
+	struct [[gnu::packed]] Header {
+		char magic[4];
+		uint32_t headerSize;
+		uint32_t payloadSize;
+		uint32_t frame;
+		int64_t timestamp;
+		uint16_t width, height, bitdepth, binX;
+		float scaleX, scaleY;
+		float exposure, gain, lens;
+		uint32_t reserved[3];
+	} h = {};
+	static_assert(sizeof(Header) == 64);
+
+	DeviceStatus status;
+	const bool haveStatus = !metadata.get("device.status", status);
+
+	memcpy(h.magic, "SMDR", 4);
+	h.headerSize = sizeof(h);
+	h.payloadSize = buffer.size();
+	h.frame = metadataDumpFrames_++;
+	h.timestamp = timestamp;
+	h.width = mode_.width;
+	h.height = mode_.height;
+	h.bitdepth = mode_.bitdepth;
+	h.binX = mode_.binX;
+	h.scaleX = mode_.scaleX;
+	h.scaleY = mode_.scaleY;
+	h.exposure = haveStatus ? status.exposureTime.get<std::micro>() : 0;
+	h.gain = haveStatus ? status.analogueGain : 0;
+	h.lens = haveStatus && status.lensPosition ? *status.lensPosition : NAN;
+
+	if (fwrite(&h, sizeof(h), 1, metadataDump_) != 1 ||
+	    fwrite(buffer.data(), 1, buffer.size(), metadataDump_) != buffer.size()) {
+		LOG(IPARPI, Error) << "Sensor metadata dump write failed, stopping it";
+		fclose(metadataDump_);
+		metadataDump_ = nullptr;
+	}
 }
 
 void IpaBase::reportMetadata(unsigned int ipaContext)

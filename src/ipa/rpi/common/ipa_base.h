@@ -10,6 +10,7 @@
 #include <deque>
 #include <map>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <libcamera/base/utils.h>
 #include <libcamera/controls.h>
@@ -117,6 +118,8 @@ private:
 	void fillDeviceStatus(const ControlList &sensorControls, unsigned int ipaContext);
 	void fillSyncParams(const PrepareParams &params, unsigned int ipaContext);
 	void reportMetadata(unsigned int ipaContext);
+	void dumpSensorMetadata(Span<const uint8_t> buffer, int64_t timestamp,
+				const RPiController::Metadata &metadata);
 	void applyFrameDurations(utils::Duration minFrameDuration, utils::Duration maxFrameDuration);
 	void applyAGC(struct AgcStatus *agcStatus, ControlList &ctrls,
 		      utils::Duration frameDurationOffset = utils::Duration(0));
@@ -165,6 +168,10 @@ private:
 	/* rpi::PdafOutputEnable and rpi::PdafImageWindow */
 	bool pdafImageOutput_ = false;
 	Rectangle pdafImageWindow_;
+
+	/* rpi::SensorMetadataDump */
+	FILE *metadataDump_ = nullptr;
+	uint32_t metadataDumpFrames_ = 0;
 
 	utils::Duration controllerMinFrameDuration_;
 };
