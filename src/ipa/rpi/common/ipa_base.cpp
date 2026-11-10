@@ -27,6 +27,7 @@
 #include "controller/denoise_algorithm.h"
 #include "controller/hdr_algorithm.h"
 #include "controller/lux_status.h"
+#include "controller/pdaf_data.h"
 #include "controller/sharpen_algorithm.h"
 #include "controller/statistics.h"
 #include "controller/sync_algorithm.h"
@@ -1597,6 +1598,22 @@ void IpaBase::reportMetadata(unsigned int ipaContext)
 			libcameraMetadata_.set(controls::SensorTemperature, *deviceStatus->sensorTemperature);
 		if (deviceStatus->lensPosition)
 			libcameraMetadata_.set(controls::LensPosition, *deviceStatus->lensPosition);
+	}
+
+	/* Phase-detect data, as the AF algorithm sees it. */
+	RPiController::PdafRegions *pdaf =
+		rpiMetadata.getLocked<RPiController::PdafRegions>("pdaf.regions");
+	if (pdaf) {
+		std::vector<float> phase(pdaf->numRegions());
+		std::vector<int32_t> conf(pdaf->numRegions());
+		for (unsigned int i = 0; i < pdaf->numRegions(); i++) {
+			const RPiController::PdafData &d = pdaf->get(i).val;
+			phase[i] = d.phase / 16.0f;
+			conf[i] = d.conf;
+		}
+		libcameraMetadata_.set(controls::rpi::PdafGrid, pdaf->size());
+		libcameraMetadata_.set(controls::rpi::PdafPhase, phase);
+		libcameraMetadata_.set(controls::rpi::PdafConfidence, conf);
 	}
 
 	AgcPrepareStatus *agcPrepareStatus = rpiMetadata.getLocked<AgcPrepareStatus>("agc.prepare_status");

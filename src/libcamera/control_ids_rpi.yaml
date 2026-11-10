@@ -299,4 +299,37 @@ controls:
         This control returns performance metrics for the CNN processing stage.
         Two values are returned in this span, the runtime of the CNN/DNN stage
         and the DSP stage in milliseconds.
+
+  - PdafGrid:
+      type: Size
+      direction: out
+      description: |
+        Size (columns x rows) of the phase-detect autofocus region grid that
+        PdafPhase and PdafConfidence describe. Reported when the sensor
+        provides PDAF data.
+
+        \sa PdafPhase PdafConfidence
+
+  - PdafPhase:
+      type: float
+      size: [n]
+      direction: out
+      description: |
+        Phase-detect autofocus phase per region, row-major over PdafGrid, as
+        the autofocus algorithm sees it. The unit is sensor specific; zero
+        means in focus and the sign tells which way the lens should move.
+        Regions without confidence report 0.
+
+        \sa PdafGrid PdafConfidence
+
+  - PdafConfidence:
+      type: int32_t
+      size: [n]
+      direction: out
+      description: |
+        Phase-detect autofocus confidence per region, row-major over
+        PdafGrid, in arbitrary units (0 = no usable phase).
+
+        \sa PdafGrid PdafPhase
+
 ...
