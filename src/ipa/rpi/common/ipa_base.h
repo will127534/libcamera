@@ -162,6 +162,10 @@ private:
 	bool cnnEnableInputTensor_;
 	bool awbEnabled_;
 
+	/* rpi::PdafOutputEnable and rpi::PdafImageWindow */
+	bool pdafImageOutput_ = false;
+	Rectangle pdafImageWindow_;
+
 	utils::Duration controllerMinFrameDuration_;
 };
 
