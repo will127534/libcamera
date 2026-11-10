@@ -53,7 +53,9 @@ Af::SpeedDependentParams::SpeedDependentParams()
 	  maxSlew(2.0),
 	  pdafFrames(20),
 	  dropoutFrames(6),
-	  stepFrames(4)
+	  stepFrames(4),
+	  pdafSettleFrames(0),
+	  pdafSettlePerDioptre(0.0)
 {
 }
 
@@ -98,6 +100,18 @@ void Af::SpeedDependentParams::read(const libcamera::ValueNode &params)
 	readNumber<uint32_t>(pdafFrames, params, "pdaf_frames");
 	readNumber<uint32_t>(dropoutFrames, params, "dropout_frames");
 	readNumber<uint32_t>(stepFrames, params, "step_frames");
+
+	/*
+	 * Optional, for lenses that take several frames to move (e.g. a
+	 * motorised interchangeable lens rather than a VCM): after each PDAF
+	 * move, ignore the phase until frames taken at the new position
+	 * arrive, instead of adding a correction every frame for an error the
+	 * lens is already correcting (which overshoots and oscillates).
+	 */
+	if (auto v = params["pdaf_settle_frames"].get<uint32_t>())
+		pdafSettleFrames = *v;
+	if (auto v = params["pdaf_settle_per_dioptre"].get<double>())
+		pdafSettlePerDioptre = *v;
 }
 
 int Af::CfgParams::read(const libcamera::ValueNode &params)
@@ -196,6 +210,7 @@ Af::Af(Controller *controller)
 	  skipCount_(0),
 	  stepCount_(0),
 	  dropCount_(0),
+	  settleCount_(0),
 	  sameSignCount_(0),
 	  sceneChangeCount_(0),
 	  scanMaxContrast_(0.0),
@@ -613,8 +628,18 @@ void Af::doAF(double contrast, double phase, double conf)
 		 * immediately (in triggered-auto) or on scene change (in CAF).
 		 */
 		if (conf >= cfg_.confEpsilon) {
-			if (mode_ == AfModeAuto || sameSignCount_ >= 3)
+			if (settleCount_ > 0) {
+				/* The phase predates the last lens move. */
+				settleCount_--;
+			} else if (mode_ == AfModeAuto || sameSignCount_ >= 3) {
+				const SpeedDependentParams &sp = cfg_.speeds[speed_];
+
 				doPDAF(phase, conf);
+				const double move = std::abs(ftarget_ - fsmooth_);
+				if (sp.pdafSettleFrames && move > 0.5 * sp.pdafSquelch)
+					settleCount_ = sp.pdafSettleFrames +
+						       std::lround(move * sp.pdafSettlePerDioptre);
+			}
 			if (stepCount_ > 0)
 				stepCount_--;
 			else if (mode_ != AfModeContinuous)
@@ -676,6 +701,8 @@ void Af::doAF(double contrast, double phase, double conf)
 				scanState_ = ScanState::Pdaf;
 			else
 				scanState_ = ScanState::Idle;
+			/* The scan just moved the lens to its peak. */
+			settleCount_ = cfg_.speeds[speed_].pdafSettleFrames;
 			dropCount_ = 0;
 			sceneChangeCount_ = 0;
 			oldSceneContrast_ = std::max(scanMaxContrast_, prevContrast_);
@@ -722,6 +749,7 @@ void Af::startAF()
 		}
 		stepCount_ = (mode_ == AfModeContinuous) ? 0 : cfg_.speeds[speed_].pdafFrames;
 		scanState_ = ScanState::Pdaf;
+		settleCount_ = 0;
 		scanData_.clear();
 		dropCount_ = 0;
 		oldSceneContrast_ = 0.0;

@@ -102,6 +102,8 @@ private:
 		uint32_t pdafFrames;		/* number of iterations when triggered */
 		uint32_t dropoutFrames;		/* number of non-PDAF frames to switch to CDAF */
 		uint32_t stepFrames;		/* frames to skip in between steps of a scan */
+		uint32_t pdafSettleFrames;	/* frames to ignore PDAF after a lens move */
+		double pdafSettlePerDioptre;	/* extra frames per dioptre moved */
 
 		SpeedDependentParams();
 		void read(const libcamera::ValueNode &params);
@@ -174,7 +176,7 @@ private:
 	double prevContrast_, oldSceneContrast_;
 	double prevAverage_[3], oldSceneAverage_[3];
 	double prevPhase_;
-	unsigned skipCount_, stepCount_, dropCount_;
+	unsigned skipCount_, stepCount_, dropCount_, settleCount_;
 	unsigned sameSignCount_;
 	unsigned sceneChangeCount_;
 	unsigned scanMaxIndex_;
